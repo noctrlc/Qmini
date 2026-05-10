@@ -1,0 +1,22 @@
+*.obj
+*.lib
+*.exe
+*.res
+*.tar.gz
+*.zip
+opus.tar.gz
+src/opus/
+opus.lib
+
+# Logs
+*.log
+sig_log.txt
+
+# IDE / temp
+.vscode/
+.vs/
+.idea/
+.claude/
+*.swp
+*.swo
+*~

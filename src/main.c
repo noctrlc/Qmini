@@ -1,0 +1,593 @@
+﻿#include "audio_capture.h"
+#include "audio_playback.h"
+#include "codec.h"
+#include "jitter_buffer.h"
+#include "network.h"
+#include "signaling.h"
+#include "tray.h"
+#include "hotkey.h"
+#include "config.h"
+#include "dialog.h"
+#include "notify.h"
+#include "ringbuf.h"
+#include <windows.h>
+#include <objbase.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <mmsystem.h>
+#include <math.h>
+
+#pragma comment(lib, "winmm.lib")
+
+
+#define OPUS_FRAME_SIZE   320    /* 20ms @ 16kHz */
+#define CAPTURE_RING_SIZE 8192
+#define SPEAKER_BUF_FRAMES 3200
+
+#define WM_JOIN_RESULT  (WM_APP + 10)
+
+typedef struct {
+    char host[64];
+    int  port;
+    char room[32];
+    char nick[32];
+    int  sig_port;
+} join_params_t;
+
+/* --- Global state --- */
+static config_t           g_cfg;
+static tray_t             g_tray;
+static hotkey_t           g_hk;
+static audio_capture_t    g_capture;
+static audio_playback_t   g_playback;
+static network_t          g_net;
+static signaling_t        g_sig;
+static codec_enc_t       *g_encoder = NULL;
+
+static uint8_t g_cap_ring_buf[CAPTURE_RING_SIZE];
+static ringbuf_t g_cap_ring;
+
+typedef struct {
+    char            id[32];
+    codec_dec_t    *dec;
+    jitter_buffer_t jb;
+    speaker_t       speaker;
+    int             active;
+} peer_state_t;
+
+static peer_state_t g_peers[MAX_PEERS];
+static int g_npeers = 0;
+static CRITICAL_SECTION g_peer_lock;
+
+static volatile int g_input_mode = INPUT_MODE_PTT;
+static volatile int g_ptt_pressed = 0;
+static int g_prev_mode = INPUT_MODE_PTT;  /* for mute toggle */
+static int g_in_room = 0;
+static volatile int g_connecting = 0;
+static volatile int g_cancel_connect = 0;
+static char g_svr[64] = {0};  /* current server address */
+static char g_rm[32] = {0};   /* current room name */
+static volatile int g_peak_pct = 0;    /* mic peak level 0-100 */
+static int g_capture_count = 0;  /* number of capture callbacks */
+static volatile int g_restart_capture = 0;
+static volatile int g_restart_playback = 0;
+
+/* Loopback test state */
+static short *g_test_buf = NULL;
+static int g_test_pos = 0;
+static int g_test_max = 0;
+static int g_test_playing = 0;
+static int g_test_capturing = 0;
+
+/* --- Callbacks --- */
+
+static void on_capture_frame(const short *samples, int count, void *user) {
+    (void)user;
+
+    g_capture_count++;
+    /* Compute peak level (0-100) */
+    int peak = 0;
+    for (int i = 0; i < count; i++) {
+        int s = samples[i] > 0 ? samples[i] : -samples[i];
+        if (s > peak) peak = s;
+    }
+    g_peak_pct = (peak * 100) / 32767;
+
+    /* Loopback capture: fill test buffer */
+    if (g_test_capturing && g_test_buf) {
+        int remaining = g_test_max - g_test_pos;
+        int copy = count < remaining ? count : remaining;
+        memcpy(g_test_buf + g_test_pos, samples, copy * sizeof(short));
+        g_test_pos += copy;
+        if (g_test_pos >= g_test_max) {
+            g_test_capturing = 0;
+            /* Start playback after short delay */
+            g_test_playing = 1;
+        }
+    }
+
+    if (g_input_mode == INPUT_MODE_MUTED) return;
+    if (g_input_mode == INPUT_MODE_PTT && !g_ptt_pressed) return;
+    /* INPUT_MODE_OPEN: always send */
+    ringbuf_push(&g_cap_ring, (const uint8_t*)samples, count * sizeof(short));
+}
+
+static void on_network_recv(const char *peer_id, const uint8_t *data, int len, void *user) {
+    (void)user;
+    EnterCriticalSection(&g_peer_lock);
+    for (int i = 0; i < g_npeers; i++) {
+        if (strcmp(g_peers[i].id, peer_id) == 0) {
+            jitter_buffer_push(&g_peers[i].jb, data, len, 0);
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_peer_lock);
+}
+
+static void update_member_list(void) {
+    const char *names[MAX_PEERS];
+    int n = g_npeers;
+    if (n > MAX_PEERS) n = MAX_PEERS;
+    for (int i = 0; i < n; i++)
+        names[i] = g_peers[i].id;
+    tray_set_members(&g_tray, names, n);
+}
+
+static void on_peer_join(const char *peer_id, const char *nickname, struct sockaddr_in *addr, void *user) {
+    (void)user; (void)nickname;
+    EnterCriticalSection(&g_peer_lock);
+    if (g_npeers >= MAX_PEERS) { LeaveCriticalSection(&g_peer_lock); return; }
+
+    peer_state_t *ps = &g_peers[g_npeers++];
+    strncpy(ps->id, peer_id, sizeof(ps->id) - 1);
+    ps->id[sizeof(ps->id) - 1] = 0;
+    ps->dec = codec_dec_create(16000, 1);
+    jitter_buffer_init(&ps->jb);
+    ps->active = 1;
+    ps->speaker.buffer = (short*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, SPEAKER_BUF_FRAMES * sizeof(short));
+    ps->speaker.capacity = SPEAKER_BUF_FRAMES;
+    ps->speaker.frames = 0;
+    ps->speaker.read_pos = 0;
+
+    network_add_peer(&g_net, peer_id, addr);
+    LeaveCriticalSection(&g_peer_lock);
+    update_member_list();
+}
+
+static void on_peer_leave(const char *peer_id, void *user) {
+    (void)user;
+    EnterCriticalSection(&g_peer_lock);
+    for (int i = 0; i < g_npeers; i++) {
+        if (strcmp(g_peers[i].id, peer_id) == 0) {
+            codec_dec_destroy(g_peers[i].dec);
+            jitter_buffer_destroy(&g_peers[i].jb);
+            if (g_peers[i].speaker.buffer)
+                HeapFree(GetProcessHeap(), 0, g_peers[i].speaker.buffer);
+            network_remove_peer(&g_net, peer_id);
+            memmove(&g_peers[i], &g_peers[i+1], (g_npeers - i - 1) * sizeof(peer_state_t));
+            g_npeers--;
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_peer_lock);
+    update_member_list();
+}
+
+static void on_ice_msg(const char *from_id, const char *sdp, void *user) {
+    (void)user; (void)from_id; (void)sdp;
+}
+
+/* --- Audio processing --- */
+
+static DWORD WINAPI join_thread(LPVOID arg) {
+    join_params_t *jp = (join_params_t*)arg;
+    HWND hwnd = g_tray.hwnd;
+
+    if (g_cancel_connect) { free(jp); g_connecting = 0; return 0; }
+
+    int ok = signaling_connect(&g_sig, jp->host, jp->port, jp->room, jp->nick, jp->sig_port);
+    if (g_cancel_connect) {
+        /* User cancelled while connecting */
+        if (ok) signaling_disconnect(&g_sig);
+        free(jp);
+        g_connecting = 0;
+        g_cancel_connect = 0;
+        PostMessageW(hwnd, WM_JOIN_RESULT, 2, 0);  /* wParam=2 means cancelled */
+        return 0;
+    }
+
+    if (ok) {
+        PostMessageW(hwnd, WM_JOIN_RESULT, 1, (LPARAM)jp);
+    } else {
+        PostMessageW(hwnd, WM_JOIN_RESULT, 0, (LPARAM)jp);
+    }
+    g_connecting = 0;
+    return 0;
+}
+
+static void process_capture(void) {
+    short samples[OPUS_FRAME_SIZE];
+    uint8_t encoded[400];
+    static float dc_state = 0.0f;
+    static int noise_gate_frames = 0;
+    /* RMS threshold: -42dB below peak (~260 in 16-bit) */
+    const int NOISE_FLOOR = 260;
+
+    while (ringbuf_avail(&g_cap_ring) >= sizeof(samples)) {
+        size_t n = ringbuf_pop(&g_cap_ring, (uint8_t*)samples, sizeof(samples));
+        if (n < sizeof(samples)) break;
+
+        /* DC offset removal (first-order high-pass, fc ~20Hz @16kHz) */
+        for (int i = 0; i < OPUS_FRAME_SIZE; i++) {
+            float x = (float)samples[i];
+            float y = x - dc_state;
+            dc_state = dc_state * 0.995f + (x - dc_state);
+            samples[i] = (short)(y > 32767 ? 32767 : (y < -32768 ? -32768 : y));
+        }
+
+        /* Noise gate: skip frames below threshold */
+        double rms = 0.0;
+        for (int i = 0; i < OPUS_FRAME_SIZE; i++) {
+            double s = samples[i];
+            rms += s * s;
+        }
+        rms = sqrt(rms / OPUS_FRAME_SIZE);
+
+        if (rms >= NOISE_FLOOR) {
+            noise_gate_frames = 10;  /* hold open for 10 frames (200ms) */
+        } else if (noise_gate_frames > 0) {
+            noise_gate_frames--;
+        } else {
+            continue;  /* silence, skip encoding */
+        }
+
+        if (g_encoder && g_npeers > 0) {
+            int len = codec_enc_encode(g_encoder, samples, OPUS_FRAME_SIZE, encoded, sizeof(encoded));
+            if (len > 0) {
+                network_send_all(&g_net, encoded, len);
+            }
+        }
+    }
+}
+
+static void process_playback(void) {
+    uint8_t data[400];
+    short pcm[OPUS_FRAME_SIZE];
+
+    EnterCriticalSection(&g_peer_lock);
+    for (int i = 0; i < g_npeers; i++) {
+        if (!g_peers[i].active) continue;
+
+        while (g_peers[i].speaker.frames < g_peers[i].speaker.capacity) {
+            int sz = jitter_buffer_pop(&g_peers[i].jb, data, NULL);
+            if (sz <= 0) break;
+
+            int dst_idx = (g_peers[i].speaker.read_pos + g_peers[i].speaker.frames) % g_peers[i].speaker.capacity;
+            int frames = codec_dec_decode(g_peers[i].dec, data, sz, pcm, OPUS_FRAME_SIZE, 1);
+            if (frames > 0) {
+                for (int j = 0; j < frames; j++) {
+                    g_peers[i].speaker.buffer[(dst_idx + j) % g_peers[i].speaker.capacity] = pcm[j];
+                }
+                g_peers[i].speaker.frames += frames;
+            }
+        }
+    }
+
+    /* Mix all active speakers and submit to playback thread */
+    if (g_npeers > 0) {
+        short mix[960];
+        int mix_frames = 960;
+        for (int i = 0; i < g_npeers; i++)
+            if (g_peers[i].active && g_peers[i].speaker.frames < mix_frames)
+                mix_frames = g_peers[i].speaker.frames;
+
+        if (mix_frames > 0) {
+            for (int i = 0; i < mix_frames; i++) {
+                int sum = 0;
+                for (int j = 0; j < g_npeers; j++) {
+                    if (g_peers[j].active && g_peers[j].speaker.frames > 0) {
+                        sum += g_peers[j].speaker.buffer[g_peers[j].speaker.read_pos];
+                        g_peers[j].speaker.read_pos = (g_peers[j].speaker.read_pos + 1) % g_peers[j].speaker.capacity;
+                        g_peers[j].speaker.frames--;
+                    }
+                }
+                if (sum > 32767) sum = 32767;
+                if (sum < -32768) sum = -32768;
+                mix[i] = (short)sum;
+            }
+            audio_playback_submit(&g_playback, mix, mix_frames);
+        }
+    }
+    LeaveCriticalSection(&g_peer_lock);
+}
+
+static void CALLBACK process_timer(HWND hwnd, UINT msg, UINT_PTR id, DWORD time) {
+    (void)hwnd; (void)msg; (void)id; (void)time;
+
+    /* Poll PTT key state (WM_HOTKEY only fires on key down, not release) */
+    if (g_input_mode == INPUT_MODE_PTT) {
+        g_ptt_pressed = (GetAsyncKeyState(g_cfg.ptt_key) & 0x8000) != 0;
+    }
+
+    process_capture();
+    process_playback();
+    if (g_in_room) network_tick(&g_net);
+    tray_set_volume(&g_tray, g_peak_pct);
+
+    /* Loopback playback: submit captured audio in chunks */
+    if (g_test_playing && g_test_buf && g_test_pos > 0) {
+        static int test_play_pos = 0;
+        static int test_play_started = 0;
+        if (!test_play_started) {
+            test_play_pos = 0;
+            test_play_started = 1;
+        }
+        int chunk = 320; /* 20ms */
+        if (test_play_pos + chunk <= g_test_pos) {
+            audio_playback_submit(&g_playback, g_test_buf + test_play_pos, chunk);
+            test_play_pos += chunk;
+        } else {
+            /* Done playing */
+            test_play_started = 0;
+            g_test_playing = 0;
+            free(g_test_buf);
+            g_test_buf = NULL;
+        }
+    }
+
+    /* Auto-restart audio when Windows switches default device */
+    if (g_restart_capture) {
+        g_restart_capture = 0;
+        audio_capture_stop(&g_capture);
+        audio_capture_start(&g_capture, on_capture_frame, NULL);
+        /* Refresh device name in tooltip */
+        tray_set_muted(&g_tray, g_input_mode == INPUT_MODE_MUTED);
+    }
+    if (g_restart_playback) {
+        g_restart_playback = 0;
+        audio_playback_stop(&g_playback);
+        audio_playback_start(&g_playback);
+        tray_set_muted(&g_tray, g_input_mode == INPUT_MODE_MUTED);
+    }
+}
+
+/* --- Main --- */
+
+int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
+    (void)prev; (void)cmd; (void)show;
+
+    /* Wrap in SEH to catch and report crashes */
+    __try {
+
+    config_load(&g_cfg);
+
+    if (!tray_create(&g_tray, inst)) {
+        /* tray_create failed - continuing is safe as long as we check hwnd before using */
+    }
+
+    tray_set_input_mode(&g_tray, g_input_mode);
+    tray_set_muted(&g_tray, g_input_mode == INPUT_MODE_MUTED);
+    hotkey_init(&g_hk, g_tray.hwnd, g_cfg.ptt_key, g_cfg.mute_key);
+
+    g_encoder = codec_enc_create(16000, 1);
+    ringbuf_init(&g_cap_ring, g_cap_ring_buf, CAPTURE_RING_SIZE);
+    InitializeCriticalSection(&g_peer_lock);
+
+    audio_playback_start(&g_playback);
+    network_init(&g_net, 0, on_network_recv, NULL);
+    if (!audio_capture_start(&g_capture, on_capture_frame, NULL)) {
+        MessageBoxW(NULL, L"音频采集初始化失败。\n请检查麦克风设备和权限。", L"Qmini 错误", MB_OK | MB_ICONERROR);
+    }
+
+    UINT_PTR timer_id = SetTimer(g_tray.hwnd, 1, 20, process_timer);
+
+    MSG msg;
+    while (GetMessage(&msg, NULL, 0, 0)) {
+        if (msg.message == WM_JOIN_RESULT) {
+            join_params_t *jp = (join_params_t*)msg.lParam;
+            if (msg.wParam == 2) {
+                /* Cancelled by user */
+                g_svr[0] = 0;
+                g_rm[0] = 0;
+                tray_set_connection(&g_tray, "", "");
+            } else if (msg.wParam == 1) {
+                g_in_room = 1;
+                update_member_list();
+                tray_set_connection(&g_tray, g_svr, g_rm);
+            } else if (jp) {
+                wchar_t werr[256];
+                _snwprintf(werr, 256,
+                    L"连接信令服务器失败。\n\n"
+                    L"服务器: %hs:%d\n"
+                    L"房间: %hs\n"
+                    L"本机 UDP 端口: %d\n\n"
+                    L"请检查服务器地址和服务器是否正在运行。",
+                    jp->host, jp->port, jp->room, jp->sig_port);
+                MessageBoxW(NULL, werr, L"Qmini 连接失败", MB_OK | MB_ICONERROR);
+                g_svr[0] = 0;
+                g_rm[0] = 0;
+                tray_set_connection(&g_tray, "", "");
+            }
+            free(jp);
+            continue;
+        }
+        if (msg.message == WM_HOTKEY) {
+            if (msg.wParam == HOTKEY_PTT) {
+                int down = (GetAsyncKeyState(g_cfg.ptt_key) & 0x8000) != 0;
+                g_ptt_pressed = down;
+            } else if (msg.wParam == HOTKEY_MUTE) {
+                /* Toggle: muted ? previous mode */
+                if (g_input_mode == INPUT_MODE_MUTED) {
+                    g_input_mode = g_prev_mode;
+                } else {
+                    g_prev_mode = g_input_mode;
+                    g_input_mode = INPUT_MODE_MUTED;
+                }
+                tray_set_input_mode(&g_tray, g_input_mode);
+                tray_set_muted(&g_tray, g_input_mode == INPUT_MODE_MUTED);
+            }
+        }
+
+        if (msg.message == g_tray.wm_trayicon) {
+            tray_wndproc(g_tray.hwnd, msg.message, msg.wParam, msg.lParam);
+        }
+
+        if (msg.message == WM_COMMAND) {
+            WORD cmd_id = LOWORD(msg.wParam);
+            if (cmd_id == TRAY_CMD_TOGGLE_MUTE) {
+                /* Toggle: muted ? previous mode */
+                if (g_input_mode == INPUT_MODE_MUTED) {
+                    g_input_mode = g_prev_mode;
+                } else {
+                    g_prev_mode = g_input_mode;
+                    g_input_mode = INPUT_MODE_MUTED;
+                }
+                tray_set_input_mode(&g_tray, g_input_mode);
+                tray_set_muted(&g_tray, g_input_mode == INPUT_MODE_MUTED);
+            } else if (cmd_id == TRAY_CMD_MODE_MUTED) {
+                if (g_input_mode != INPUT_MODE_MUTED) g_prev_mode = g_input_mode;
+                g_input_mode = INPUT_MODE_MUTED;
+                tray_set_input_mode(&g_tray, g_input_mode);
+                tray_set_muted(&g_tray, 1);
+            } else if (cmd_id == TRAY_CMD_MODE_PTT) {
+                g_input_mode = INPUT_MODE_PTT;
+                tray_set_input_mode(&g_tray, g_input_mode);
+                tray_set_muted(&g_tray, 0);
+            } else if (cmd_id == TRAY_CMD_MODE_OPEN) {
+                g_input_mode = INPUT_MODE_OPEN;
+                tray_set_input_mode(&g_tray, g_input_mode);
+                tray_set_muted(&g_tray, 0);
+            } else if (cmd_id == TRAY_CMD_JOIN_ROOM) {
+                if (!g_in_room && !g_connecting) {
+                    char server[64] = {0};
+                    char room[32] = "default";
+                    char nick[32] = {0};
+                    strncpy(server, g_cfg.server_addr, sizeof(server) - 1);
+                    strncpy(nick, g_cfg.nickname, sizeof(nick) - 1);
+
+                    if (join_dialog_show(g_tray.inst, g_tray.hwnd,
+                                         server, sizeof(server),
+                                         room, sizeof(room),
+                                         nick, sizeof(nick))) {
+                        join_params_t *jp = (join_params_t*)malloc(sizeof(join_params_t));
+                        if (!jp) continue;
+                        memset(jp, 0, sizeof(*jp));
+                        sscanf(server, "%63[^:]:%d", jp->host, &jp->port);
+                        strncpy(jp->room, room, sizeof(jp->room) - 1);
+                        strncpy(jp->nick, nick, sizeof(jp->nick) - 1);
+                        jp->sig_port = network_get_port(&g_net);
+
+                        /* Set callbacks before connect: server may send PEER_JOIN immediately */
+                        g_sig.peer_join_cb = on_peer_join;
+                        g_sig.peer_leave_cb = on_peer_leave;
+                        g_sig.ice_cb = on_ice_msg;
+                        g_sig.user_data = NULL;
+
+                        /* Save config so UI reflects intent */
+                        strncpy(g_cfg.server_addr, server, sizeof(g_cfg.server_addr) - 1);
+                        strncpy(g_cfg.nickname, nick, sizeof(g_cfg.nickname) - 1);
+                        config_save(&g_cfg);
+
+                        /* Tooltip shows connecting state */
+                        strncpy(g_svr, server, sizeof(g_svr) - 1);
+                        strncpy(g_rm, room, sizeof(g_rm) - 1);
+                        tray_set_connection(&g_tray, g_svr, g_rm);
+
+                        g_cancel_connect = 0;
+                        g_connecting = 1;
+                        HANDLE h = CreateThread(NULL, 0, join_thread, jp, 0, NULL);
+                        CloseHandle(h);
+                    }
+                }
+            } else if (cmd_id == TRAY_CMD_LEAVE_ROOM) {
+                if (g_connecting) {
+                    /* Cancel pending connection */
+                    g_cancel_connect = 1;
+                    g_connecting = 0;
+                    g_svr[0] = 0;
+                    g_rm[0] = 0;
+                    tray_set_connection(&g_tray, "", "");
+                } else if (g_in_room) {
+                    EnterCriticalSection(&g_peer_lock);
+                    for (int i = 0; i < g_npeers; i++) {
+                        codec_dec_destroy(g_peers[i].dec);
+                        jitter_buffer_destroy(&g_peers[i].jb);
+                        if (g_peers[i].speaker.buffer)
+                            HeapFree(GetProcessHeap(), 0, g_peers[i].speaker.buffer);
+                    }
+                    g_npeers = 0;
+                    LeaveCriticalSection(&g_peer_lock);
+
+                    signaling_disconnect(&g_sig);
+                    g_in_room = 0;
+                    g_svr[0] = 0;
+                    g_rm[0] = 0;
+                    tray_set_connection(&g_tray, "", "");
+                    tray_set_members(&g_tray, NULL, 0);
+                }
+            } else if (cmd_id == TRAY_CMD_TEST_AUDIO) {
+                /* Step 1: Test tone to verify output */
+                short tone[16000];
+                for (int i = 0; i < 16000; i++) {
+                    double val = sin(2.0 * 3.141592653589793 * 440.0 * i / 16000.0);
+                    tone[i] = (short)(val * 8000.0);
+                }
+                audio_playback_submit(&g_playback, tone, 16000);
+
+                /* Step 2: Loopback test - capture 1.5s of mic, then play back */
+                if (g_test_buf) free(g_test_buf);
+                g_test_buf = (short*)malloc(24000 * sizeof(short));
+                if (g_test_buf) {
+                    g_test_pos = 0;
+                    g_test_max = 24000;
+                    g_test_capturing = 1;
+                    g_test_playing = 0;
+                }
+
+                MessageBoxW(NULL,
+                    L"正在播放测试音...你应该听到 1 秒蜂鸣声。\n\n"
+                    L"然后对着麦克风说话 1.5 秒，"
+                    L"之后会回放你的声音。\n\n"
+                    L"测试流程：蜂鸣声 → 录音 → 回放",
+                    L"音频测试", MB_OK | MB_ICONINFORMATION);
+            } else if (cmd_id == TRAY_CMD_AUDIO_DEVICES) {
+                MessageBoxW(NULL,
+                    L"输入设备和输出设备由 Windows 声音设置管理。\nQmini 自动跟随默认通信设备。",
+                    L"音频设备", MB_OK | MB_ICONINFORMATION);
+            } else if (cmd_id == TRAY_CMD_EXIT) {
+                break;
+            }
+        }
+
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+
+    KillTimer(g_tray.hwnd, timer_id);
+    audio_capture_stop(&g_capture);
+    audio_playback_stop(&g_playback);
+    network_close(&g_net);
+    if (g_in_room) signaling_disconnect(&g_sig);
+    if (g_encoder) codec_enc_destroy(g_encoder);
+
+    EnterCriticalSection(&g_peer_lock);
+    for (int i = 0; i < g_npeers; i++) {
+        codec_dec_destroy(g_peers[i].dec);
+        jitter_buffer_destroy(&g_peers[i].jb);
+        if (g_peers[i].speaker.buffer)
+            HeapFree(GetProcessHeap(), 0, g_peers[i].speaker.buffer);
+    }
+    g_npeers = 0;
+    LeaveCriticalSection(&g_peer_lock);
+    DeleteCriticalSection(&g_peer_lock);
+
+    hotkey_destroy(&g_hk);
+    tray_destroy(&g_tray);
+    notify_shutdown(NULL, NULL);
+    return 0;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        MessageBoxW(NULL, L"Qmini 遇到错误，需要关闭。", L"Qmini 错误", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+}
