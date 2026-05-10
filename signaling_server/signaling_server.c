@@ -29,7 +29,8 @@ typedef struct {
     char    id[MAX_ID];
     char    nickname[MAX_NAME];
     char    room[MAX_NAME];
-    struct sockaddr_in addr;
+    struct sockaddr_in addr;   /* TCP peer address (IP correct, port is TCP ephemeral) */
+    int     local_port;        /* UDP port from REGISTER, for P2P audio */
     int     active;
 } client_t;
 
@@ -124,6 +125,7 @@ static DWORD WINAPI client_thread(LPVOID arg) {
                 strncpy(c->room, room, sizeof(c->room) - 1);
                 strncpy(c->nickname, nick, sizeof(c->nickname) - 1);
                 strncpy(c->id, id, sizeof(c->id) - 1);
+                c->local_port = local_port;  /* store UDP port for P2P */
 
                 v_send(s, "OK %s", id);
                 LOG("REGISTER: room=%s nick=%s port=%d -> id=%s", room, nick, local_port, id);
@@ -144,7 +146,7 @@ static DWORD WINAPI client_thread(LPVOID arg) {
                         v_send(s, "PEER_JOIN %s %s %s %d",
                                g_clients[j].id, g_clients[j].nickname,
                                inet_ntoa(g_clients[j].addr.sin_addr),
-                               ntohs(g_clients[j].addr.sin_port));
+                               g_clients[j].local_port);
                     }
                 }
                 LeaveCriticalSection(&g_lock);
@@ -212,7 +214,7 @@ int main() {
     addr.sin_port = htons(9088);
 
     if (bind(listen_sock, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        printf("Failed to bind port 9800 (try running as admin?)\n");
+        printf("Failed to bind port 9088 (try running as admin?)\n");
         closesocket(listen_sock);
         WSACleanup();
         return 1;

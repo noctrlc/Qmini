@@ -50,6 +50,7 @@ static ringbuf_t g_cap_ring;
 
 typedef struct {
     char            id[32];
+    char            nick[32];
     codec_dec_t    *dec;
     jitter_buffer_t jb;
     speaker_t       speaker;
@@ -130,18 +131,20 @@ static void update_member_list(void) {
     int n = g_npeers;
     if (n > MAX_PEERS) n = MAX_PEERS;
     for (int i = 0; i < n; i++)
-        names[i] = g_peers[i].id;
+        names[i] = g_peers[i].nick[0] ? g_peers[i].nick : g_peers[i].id;
     tray_set_members(&g_tray, names, n);
 }
 
 static void on_peer_join(const char *peer_id, const char *nickname, struct sockaddr_in *addr, void *user) {
-    (void)user; (void)nickname;
+    (void)user;
     EnterCriticalSection(&g_peer_lock);
     if (g_npeers >= MAX_PEERS) { LeaveCriticalSection(&g_peer_lock); return; }
 
     peer_state_t *ps = &g_peers[g_npeers++];
     strncpy(ps->id, peer_id, sizeof(ps->id) - 1);
     ps->id[sizeof(ps->id) - 1] = 0;
+    strncpy(ps->nick, nickname, sizeof(ps->nick) - 1);
+    ps->nick[sizeof(ps->nick) - 1] = 0;
     ps->dec = codec_dec_create(16000, 1);
     jitter_buffer_init(&ps->jb);
     ps->active = 1;

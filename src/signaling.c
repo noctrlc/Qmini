@@ -94,7 +94,18 @@ int signaling_connect(signaling_t *sig, const char *host, int port, const char *
               host, port, room, nickname, local_port);
     log_msg(log_buf);
 
-    memset(sig, 0, sizeof(*sig));
+    /* Save callbacks before clearing - they are set before connect */
+    {
+        void (*saved_join)(const char*, const char*, struct sockaddr_in*, void*) = sig->peer_join_cb;
+        void (*saved_leave)(const char*, void*) = sig->peer_leave_cb;
+        void (*saved_ice)(const char*, const char*, void*) = sig->ice_cb;
+        void *saved_user = sig->user_data;
+        memset(sig, 0, sizeof(*sig));
+        sig->peer_join_cb = saved_join;
+        sig->peer_leave_cb = saved_leave;
+        sig->ice_cb = saved_ice;
+        sig->user_data = saved_user;
+    }
     sig->running = 1;
     strncpy(sig->server_host, host, sizeof(sig->server_host) - 1);
     sig->server_port = port;
