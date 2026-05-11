@@ -28,6 +28,7 @@ typedef struct {
     uint16_t         seq_send;
     void             *user_data;
     void             (*recv_cb)(const char *peer_id, const uint8_t *data, int len, void *user);
+    CRITICAL_SECTION lock;
 } network_t;
 
 int  network_init(network_t *net, uint16_t port, void (*cb)(const char*, const uint8_t*, int, void*), void *user);

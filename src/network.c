@@ -39,12 +39,14 @@ static DWORD WINAPI net_recv_thread(LPVOID arg) {
         /* 32-byte header-only packet = keepalive/ping.
            Update peer address (handles NAT rebinding) and skip. */
         if (n == 32) {
+            EnterCriticalSection(&net->lock);
             for (int i = 0; i < net->npeers; i++) {
                 if (strcmp(net->peers[i].id, peer_id) == 0) {
                     net->peers[i].addr = from;
                     break;
                 }
             }
+            LeaveCriticalSection(&net->lock);
             continue;
         }
 
@@ -59,6 +61,7 @@ int network_init(network_t *net, uint16_t port, void (*cb)(const char*, const ui
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return 0;
 
     memset(net, 0, sizeof(*net));
+    InitializeCriticalSection(&net->lock);
     net->running = 1;
     net->recv_cb = cb;
     net->user_data = user;
@@ -105,28 +108,34 @@ void network_close(network_t *net) {
         closesocket(net->udp_sock);
         net->udp_sock = INVALID_SOCKET;
     }
+    DeleteCriticalSection(&net->lock);
     WSACleanup();
 }
 
 int network_add_peer(network_t *net, const char *id, const struct sockaddr_in *addr) {
-    if (net->npeers >= MAX_PEERS) return 0;
+    EnterCriticalSection(&net->lock);
+    if (net->npeers >= MAX_PEERS) { LeaveCriticalSection(&net->lock); return 0; }
     peer_t *p = &net->peers[net->npeers++];
     strncpy(p->id, id, sizeof(p->id) - 1);
     p->addr = *addr;
     p->connected = 1;
     p->seq_send = 0;
-    p->last_keepalive = 0;  /* send keepalive immediately */
+    p->last_keepalive = 0;
+    LeaveCriticalSection(&net->lock);
     return 1;
 }
 
 void network_remove_peer(network_t *net, const char *id) {
+    EnterCriticalSection(&net->lock);
     for (int i = 0; i < net->npeers; i++) {
         if (strcmp(net->peers[i].id, id) == 0) {
             memmove(&net->peers[i], &net->peers[i+1], (net->npeers - i - 1) * sizeof(peer_t));
             net->npeers--;
+            LeaveCriticalSection(&net->lock);
             return;
         }
     }
+    LeaveCriticalSection(&net->lock);
 }
 
 int network_send(network_t *net, const char *peer_id, const uint8_t *data, int len) {
@@ -150,8 +159,10 @@ int network_send(network_t *net, const char *peer_id, const uint8_t *data, int l
 
 int network_send_all(network_t *net, const uint8_t *data, int len) {
     int ok = 0;
+    EnterCriticalSection(&net->lock);
     for (int i = 0; i < net->npeers; i++)
         if (network_send(net, net->peers[i].id, data, len)) ok = 1;
+    LeaveCriticalSection(&net->lock);
     return ok;
 }
 
@@ -174,6 +185,7 @@ void network_tick(network_t *net) {
     memset(buf, 0, 32);
     memcpy(buf, net->local_id, id_len - 1);
 
+    EnterCriticalSection(&net->lock);
     for (int i = 0; i < net->npeers; i++) {
         if (net->peers[i].connected && now - net->peers[i].last_keepalive >= 3000) {
             sendto(net->udp_sock, (const char*)buf, 32, 0,
@@ -181,4 +193,5 @@ void network_tick(network_t *net) {
             net->peers[i].last_keepalive = now;
         }
     }
+    LeaveCriticalSection(&net->lock);
 }

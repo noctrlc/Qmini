@@ -20,7 +20,7 @@ void jitter_buffer_destroy(jitter_buffer_t *jb) {
 void jitter_buffer_push(jitter_buffer_t *jb, const uint8_t *data, int size, uint16_t seq) {
     if (jb->count >= JB_CAPACITY) return;
 
-    int idx = (jb->write_cursor + jb->count) & 0x7F;
+    int idx = jb->write_cursor & 0x7F;
     uint8_t *p = (uint8_t*)malloc(size);
     if (!p) return;
     memcpy(p, data, size);
@@ -28,6 +28,7 @@ void jitter_buffer_push(jitter_buffer_t *jb, const uint8_t *data, int size, uint
     jb->packets[idx]      = p;
     jb->sizes[idx]        = size;
     jb->seq_numbers[idx]  = seq;
+    jb->write_cursor++;
     jb->count++;
 }
 
