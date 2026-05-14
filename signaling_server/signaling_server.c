@@ -29,7 +29,10 @@ typedef struct {
     char    id[MAX_ID];
     char    nickname[MAX_NAME];
     char    room[MAX_NAME];
-    struct sockaddr_in addr;
+    struct sockaddr_in addr;   /* TCP peer address (IP correct, port is TCP ephemeral) */
+    struct sockaddr_in udp_addr; /* Observed UDP address for SFU relay */
+    int     udp_known;         /* 1 = udp_addr has been populated from a received packet */
+    int     local_port;        /* UDP port from REGISTER, for P2P audio */
     int     active;
 } client_t;
 
@@ -37,6 +40,9 @@ static client_t g_clients[MAX_CLIENTS];
 static int g_next_id = 1;
 static CRITICAL_SECTION g_lock;
 static FILE *g_log = NULL;
+static SOCKET g_udp_sock = INVALID_SOCKET;  /* UDP relay socket for SFU */
+#define SFU_RELAY_PORT 9089
+#define SFU_MAX_PACKET 1500
 #define LOG(fmt, ...) do { \
     if (g_log) { fprintf(g_log, fmt "\n", ##__VA_ARGS__); fflush(g_log); } \
     printf(fmt "\n", ##__VA_ARGS__); \
@@ -85,6 +91,7 @@ static void remove_client(SOCKET s) {
         if (g_clients[i].active && g_clients[i].sock == s) {
             LOG("Client disconnected: id=%s room=%s nick=%s", g_clients[i].id, g_clients[i].room, g_clients[i].nickname);
             g_clients[i].active = 0;
+            g_clients[i].udp_known = 0;
             broadcast_room(g_clients[i].room, s, "PEER_LEAVE %s", g_clients[i].id);
             closesocket(s);
             LeaveCriticalSection(&g_lock);
@@ -92,6 +99,141 @@ static void remove_client(SOCKET s) {
         }
     }
     LeaveCriticalSection(&g_lock);
+}
+
+/* Find a client by their observed UDP address (IP + port) */
+static client_t* find_client_by_udp(const struct sockaddr_in *from) {
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (g_clients[i].active && g_clients[i].udp_known &&
+            g_clients[i].udp_addr.sin_addr.s_addr == from->sin_addr.s_addr &&
+            g_clients[i].udp_addr.sin_port == from->sin_port) {
+            return &g_clients[i];
+        }
+    }
+    return NULL;
+}
+
+/* Find a client by their ID string */
+static client_t* find_client_by_id(const char *id) {
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (g_clients[i].active && strcmp(g_clients[i].id, id) == 0)
+            return &g_clients[i];
+    }
+    return NULL;
+}
+
+/* SFU relay thread: receives UDP audio packets from clients and forwards
+   to all other clients in the same room.
+   Packet format: 32-byte sender_id header + audio payload */
+static DWORD WINAPI sfu_relay_thread(LPVOID arg) {
+    (void)arg;
+    uint8_t buf[SFU_MAX_PACKET];
+    struct sockaddr_in from;
+    int from_len;
+
+    LOG("SFU relay thread started on UDP port %d", SFU_RELAY_PORT);
+
+    while (1) {
+        from_len = sizeof(from);
+        int n = recvfrom(g_udp_sock, (char*)buf, SFU_MAX_PACKET, 0,
+                         (struct sockaddr*)&from, &from_len);
+        if (n <= 0) continue;
+
+        /* Handle HELLO message for initial UDP address mapping */
+        if (n >= 6 && memcmp(buf, "HELLO ", 6) == 0) {
+            char hello_id[MAX_ID] = {0};
+            int copy_len = n - 6;
+            if (copy_len >= MAX_ID) copy_len = MAX_ID - 1;
+            memcpy(hello_id, buf + 6, copy_len);
+            hello_id[copy_len] = 0;
+
+            EnterCriticalSection(&g_lock);
+            client_t *c = find_client_by_id(hello_id);
+            if (c) {
+                c->udp_addr = from;
+                c->udp_known = 1;
+                LOG("SFU: HELLO from %s, UDP mapped to %s:%d",
+                    hello_id, inet_ntoa(from.sin_addr), ntohs(from.sin_port));
+            }
+            LeaveCriticalSection(&g_lock);
+            continue;
+        }
+
+        if (n < 32) continue;  /* Need at least 32-byte ID header */
+
+        /* Extract sender ID from packet header */
+        char sender_id[MAX_ID] = {0};
+        memcpy(sender_id, buf, 32);
+        sender_id[MAX_ID - 1] = 0;
+        /* Trim trailing zeros */
+        for (int k = (int)strlen(sender_id); k < 32 && sender_id[k] != 0; k++)
+            sender_id[k] = 0;
+
+        EnterCriticalSection(&g_lock);
+
+        /* Try to match by UDP address first (faster), then by ID */
+        client_t *sender = find_client_by_udp(&from);
+        if (!sender) {
+            sender = find_client_by_id(sender_id);
+            if (sender) {
+                /* Cache the UDP address for future packets */
+                sender->udp_addr = from;
+                sender->udp_known = 1;
+            }
+        }
+
+        if (!sender) {
+            LeaveCriticalSection(&g_lock);
+            continue;
+        }
+
+        /* Forward to all other active clients in the same room */
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            if (!g_clients[i].active || &g_clients[i] == sender)
+                continue;
+            if (strcmp(g_clients[i].room, sender->room) != 0)
+                continue;
+            if (!g_clients[i].udp_known)
+                continue;  /* Skip clients whose UDP address is not yet known */
+
+            sendto(g_udp_sock, (const char*)buf, n, 0,
+                   (struct sockaddr*)&g_clients[i].udp_addr,
+                   sizeof(g_clients[i].udp_addr));
+        }
+
+        LeaveCriticalSection(&g_lock);
+    }
+    return 0;
+}
+
+/* Initialize the UDP relay socket for SFU and start the relay thread */
+static int init_udp_relay(uint16_t port) {
+    g_udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (g_udp_sock == INVALID_SOCKET) {
+        LOG("Failed to create UDP relay socket");
+        return 0;
+    }
+
+    int opt = 1;
+    setsockopt(g_udp_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+
+    struct sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(port);
+
+    if (bind(g_udp_sock, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+        LOG("Failed to bind UDP relay port %d", port);
+        closesocket(g_udp_sock);
+        g_udp_sock = INVALID_SOCKET;
+        return 0;
+    }
+
+    HANDLE h = CreateThread(NULL, 0, sfu_relay_thread, NULL, 0, NULL);
+    if (h) CloseHandle(h);
+
+    LOG("SFU relay initialized on UDP port %d", port);
+    return 1;
 }
 
 static DWORD WINAPI client_thread(LPVOID arg) {
@@ -124,6 +266,7 @@ static DWORD WINAPI client_thread(LPVOID arg) {
                 strncpy(c->room, room, sizeof(c->room) - 1);
                 strncpy(c->nickname, nick, sizeof(c->nickname) - 1);
                 strncpy(c->id, id, sizeof(c->id) - 1);
+                c->local_port = local_port;  /* store UDP port for P2P */
 
                 v_send(s, "OK %s", id);
                 LOG("REGISTER: room=%s nick=%s port=%d -> id=%s", room, nick, local_port, id);
@@ -144,7 +287,7 @@ static DWORD WINAPI client_thread(LPVOID arg) {
                         v_send(s, "PEER_JOIN %s %s %s %d",
                                g_clients[j].id, g_clients[j].nickname,
                                inet_ntoa(g_clients[j].addr.sin_addr),
-                               ntohs(g_clients[j].addr.sin_port));
+                               g_clients[j].local_port);
                     }
                 }
                 LeaveCriticalSection(&g_lock);
@@ -212,7 +355,7 @@ int main() {
     addr.sin_port = htons(9088);
 
     if (bind(listen_sock, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        printf("Failed to bind port 9800 (try running as admin?)\n");
+        printf("Failed to bind port 9088 (try running as admin?)\n");
         closesocket(listen_sock);
         WSACleanup();
         return 1;
@@ -242,6 +385,14 @@ int main() {
         }
     }
     LOG("  Local: 127.0.0.1:9088");
+
+    /* Initialize SFU UDP relay */
+    if (init_udp_relay(SFU_RELAY_PORT)) {
+        LOG("  SFU relay: UDP port %d", SFU_RELAY_PORT);
+    } else {
+        LOG("  WARNING: SFU relay failed to start");
+    }
+
     LOG("Press Ctrl+C to exit");
 
     while (1) {
@@ -275,6 +426,7 @@ int main() {
     }
 
     DeleteCriticalSection(&g_lock);
+    if (g_udp_sock != INVALID_SOCKET) closesocket(g_udp_sock);
     closesocket(listen_sock);
     WSACleanup();
     return 0;
