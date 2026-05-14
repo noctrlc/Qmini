@@ -13,6 +13,12 @@ typedef struct {
     int       read_cursor;
     int       write_cursor;
     int       target_level;
+    uint32_t  last_arrival_time;   /* Last packet arrival time (ms) */
+    uint32_t  jitter_avg;          /* Average jitter (ms) */
+    uint32_t  jitter_variance;     /* Jitter variance */
+    uint32_t  last_adaptation;     /* Last adaptation time */
+    int       min_target;          /* Minimum buffer depth */
+    int       max_target;          /* Maximum buffer depth */
 } jitter_buffer_t;
 
 void jitter_buffer_init(jitter_buffer_t *jb);
