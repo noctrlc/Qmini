@@ -53,8 +53,8 @@ static signaling_t        g_sig;
 static codec_enc_t       *g_encoder = NULL;
 static crypto_ctx_t       g_crypto;
 aec_t                    *g_aec = NULL;
-static agc_t             *g_agc = NULL;
-static ns_t              *g_ns = NULL;
+agc_t                    *g_agc = NULL;
+ns_t                     *g_ns = NULL;
 static congestion_ctrl_t  g_cc;
 
 /* SFU mode globals */
