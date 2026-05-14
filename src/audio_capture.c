@@ -1,5 +1,7 @@
 #include "audio_capture.h"
 #include "aec.h"
+#include "agc.h"
+#include "ns.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,6 +14,8 @@
 #define CAPTURE_BUF_COUNT  4
 
 extern aec_t *g_aec;
+extern agc_t *g_agc;
+extern ns_t  *g_ns;
 
 static short g_aec_ref_buf[CAPTURE_BUF_FRAMES] = {0};
 
@@ -50,7 +54,13 @@ static void CALLBACK wavein_cb(HWAVEIN hwi, UINT msg, DWORD_PTR inst, DWORD_PTR 
         }
     }
 
-    /* Callback with the (echo-cancelled) samples */
+    /* Apply Noise Suppression */
+    if (g_ns) ns_process(g_ns, buf, frames);
+
+    /* Apply Automatic Gain Control */
+    if (g_agc) agc_process(g_agc, buf, frames);
+
+    /* Callback with the processed samples */
     ac->callback((const short*)buf, frames, ac->user_data);
 
     /* Re-queue the buffer */

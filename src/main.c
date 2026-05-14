@@ -12,6 +12,8 @@
 #include "crypto.h"
 #include "ringbuf.h"
 #include "aec.h"
+#include "agc.h"
+#include "ns.h"
 #include "congestion.h"
 #include <windows.h>
 #include <objbase.h>
@@ -50,6 +52,8 @@ static signaling_t        g_sig;
 static codec_enc_t       *g_encoder = NULL;
 static crypto_ctx_t       g_crypto;
 aec_t                    *g_aec = NULL;
+static agc_t             *g_agc = NULL;
+static ns_t              *g_ns = NULL;
 static congestion_ctrl_t  g_cc;
 
 static uint8_t g_cap_ring_buf[CAPTURE_RING_SIZE];
@@ -527,6 +531,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
 
     audio_playback_start(&g_playback);
     g_aec = aec_create();
+    g_ns = ns_create(16000);
+    g_agc = agc_create(16000, -20);
     network_init(&g_net, 0, on_network_recv, NULL);
     g_net.keepalive_cb = on_keepalive_recv;
     congestion_init(&g_cc);
@@ -731,6 +737,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
 
     KillTimer(g_panel.hwnd, timer_id);
     audio_capture_stop(&g_capture);
+    agc_destroy(g_agc);
+    g_agc = NULL;
+    ns_destroy(g_ns);
+    g_ns = NULL;
     aec_destroy(g_aec);
     g_aec = NULL;
     audio_playback_stop(&g_playback);
