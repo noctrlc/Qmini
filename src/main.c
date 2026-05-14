@@ -15,6 +15,7 @@
 #include "agc.h"
 #include "ns.h"
 #include "congestion.h"
+#include "sfu_client.h"
 #include <windows.h>
 #include <objbase.h>
 #include <stdlib.h>
@@ -55,6 +56,12 @@ aec_t                    *g_aec = NULL;
 static agc_t             *g_agc = NULL;
 static ns_t              *g_ns = NULL;
 static congestion_ctrl_t  g_cc;
+
+/* SFU mode globals */
+static sfu_client_t       g_sfu;
+static volatile int       g_sfu_mode = 0;     /* 1 = SFU relay mode active */
+#define SFU_PEER_THRESHOLD  6                  /* Switch to SFU when peers > this */
+#define SFU_RELAY_PORT      9089
 
 static uint8_t g_cap_ring_buf[CAPTURE_RING_SIZE];
 static ringbuf_t g_cap_ring;
@@ -167,6 +174,20 @@ static void on_relay_recv(const char *from_id, const uint8_t *data, int len, voi
     LeaveCriticalSection(&g_peer_lock);
 }
 
+static void on_sfu_recv(const char *peer_id, const uint8_t *data, int len, void *user) {
+    (void)user;
+    EnterCriticalSection(&g_peer_lock);
+    for (int i = 0; i < g_npeers; i++) {
+        if (strcmp(g_peers[i].id, peer_id) == 0) {
+            g_peers[i].last_udp_recv = GetTickCount();
+            g_peers[i].use_relay = 0;  /* SFU is working */
+            jitter_buffer_push(&g_peers[i].jb, data, len, 0);
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_peer_lock);
+}
+
 static void update_member_list(void) {
     const char *names[MAX_PEERS + 1];
     int n = 0;
@@ -207,6 +228,12 @@ static void on_peer_join(const char *peer_id, const char *nickname, struct socka
     ps->speaker.read_pos = 0;
 
     network_add_peer(&g_net, peer_id, addr);
+
+    /* Switch to SFU mode if peer count exceeds threshold */
+    if (g_npeers > SFU_PEER_THRESHOLD && !g_sfu_mode && g_sfu.connected) {
+        g_sfu_mode = 1;
+    }
+
     LeaveCriticalSection(&g_peer_lock);
     update_member_list();
 }
@@ -223,6 +250,11 @@ static void on_peer_leave(const char *peer_id, void *user) {
             network_remove_peer(&g_net, peer_id);
             memmove(&g_peers[i], &g_peers[i+1], (g_npeers - i - 1) * sizeof(peer_state_t));
             g_npeers--;
+
+            /* Switch back to P2P if peer count drops below threshold */
+            if (g_npeers <= SFU_PEER_THRESHOLD && g_sfu_mode) {
+                g_sfu_mode = 0;
+            }
             break;
         }
     }
@@ -267,6 +299,16 @@ static DWORD WINAPI join_thread(LPVOID arg) {
     if (ok) {
         /* Sync P2P packet ID with server-assigned signaling ID */
         network_set_local_id(&g_net, g_sig.local_id);
+
+        /* Initialize SFU client for large-room relay mode */
+        sfu_init(&g_sfu, jp->host, SFU_RELAY_PORT, on_sfu_recv, NULL);
+        sfu_set_local_id(&g_sfu, g_sig.local_id);
+        /* Send HELLO to establish UDP mapping with SFU relay server */
+        for (int i = 0; i < 3; i++) {
+            sfu_send_hello(&g_sfu);
+            Sleep(50);
+        }
+
         PostMessageW(hwnd, WM_JOIN_RESULT, 1, (LPARAM)jp);
     } else {
         PostMessageW(hwnd, WM_JOIN_RESULT, 0, (LPARAM)jp);
@@ -317,12 +359,16 @@ static void process_capture(void) {
                 int len = codec_enc_encode(g_encoder, NULL, OPUS_FRAME_SIZE, encoded, sizeof(encoded));
                 if (len > 0) {
                     EnterCriticalSection(&g_peer_lock);
-                    for (int i = 0; i < g_npeers; i++) {
-                        if (!g_peers[i].active) continue;
-                        if (g_peers[i].use_relay)
-                            signaling_send_relay(&g_sig, g_peers[i].id, encoded, len);
-                        else
-                            network_send(&g_net, g_peers[i].id, encoded, len);
+                    if (g_sfu_mode) {
+                        sfu_send(&g_sfu, encoded, len);
+                    } else {
+                        for (int i = 0; i < g_npeers; i++) {
+                            if (!g_peers[i].active) continue;
+                            if (g_peers[i].use_relay)
+                                signaling_send_relay(&g_sig, g_peers[i].id, encoded, len);
+                            else
+                                network_send(&g_net, g_peers[i].id, encoded, len);
+                        }
                     }
                     LeaveCriticalSection(&g_peer_lock);
                 }
@@ -341,22 +387,28 @@ static void process_capture(void) {
             int len = codec_enc_encode(g_encoder, samples, OPUS_FRAME_SIZE, encoded, sizeof(encoded));
             if (len > 0) {
                 congestion_update_sent(&g_cc);
-                DWORD now = GetTickCount();
                 EnterCriticalSection(&g_peer_lock);
-                for (int i = 0; i < g_npeers; i++) {
-                    if (!g_peers[i].active) continue;
-                    /* Auto-detect: if no UDP received for 3s after join, switch to relay */
-                    if (!g_peers[i].use_relay) {
-                        DWORD ref_time = g_peers[i].last_udp_recv > 0 ?
-                                         g_peers[i].last_udp_recv : g_peers[i].joined_time;
-                        if (now - ref_time > 3000) {
-                            g_peers[i].use_relay = 1;
+                if (g_sfu_mode) {
+                    /* SFU mode: single send to server, server relays to all peers */
+                    sfu_send(&g_sfu, encoded, len);
+                } else {
+                    /* P2P mode: send to each peer individually */
+                    DWORD now = GetTickCount();
+                    for (int i = 0; i < g_npeers; i++) {
+                        if (!g_peers[i].active) continue;
+                        /* Auto-detect: if no UDP received for 3s after join, switch to relay */
+                        if (!g_peers[i].use_relay) {
+                            DWORD ref_time = g_peers[i].last_udp_recv > 0 ?
+                                             g_peers[i].last_udp_recv : g_peers[i].joined_time;
+                            if (now - ref_time > 3000) {
+                                g_peers[i].use_relay = 1;
+                            }
                         }
-                    }
-                    if (g_peers[i].use_relay) {
-                        signaling_send_relay(&g_sig, g_peers[i].id, encoded, len);
-                    } else {
-                        network_send(&g_net, g_peers[i].id, encoded, len);
+                        if (g_peers[i].use_relay) {
+                            signaling_send_relay(&g_sig, g_peers[i].id, encoded, len);
+                        } else {
+                            network_send(&g_net, g_peers[i].id, encoded, len);
+                        }
                     }
                 }
                 LeaveCriticalSection(&g_peer_lock);
@@ -453,6 +505,8 @@ static void CALLBACK process_timer(HWND hwnd, UINT msg, UINT_PTR id, DWORD time)
         network_tick(&g_net);
         /* Detect signaling connection loss and clean up */
         if (!signaling_is_connected(&g_sig)) {
+            sfu_close(&g_sfu);
+            g_sfu_mode = 0;
             EnterCriticalSection(&g_peer_lock);
             for (int i = 0; i < g_npeers; i++) {
                 codec_dec_destroy(g_peers[i].dec);
@@ -675,6 +729,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
                     g_rm[0] = 0;
                     panel_set_connection(&g_panel, "", "");
                 } else if (g_in_room) {
+                    /* Close SFU client */
+                    sfu_close(&g_sfu);
+                    g_sfu_mode = 0;
+
                     /* Clear crypto context */
                     memset(&g_crypto, 0, sizeof(g_crypto));
                     network_set_crypto(&g_net, NULL);
@@ -744,7 +802,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
     aec_destroy(g_aec);
     g_aec = NULL;
     audio_playback_stop(&g_playback);
-    if (g_in_room) signaling_disconnect(&g_sig);   /* TCP before WSACleanup */
+    sfu_close(&g_sfu);                              /* SFU client cleanup */
+    if (g_in_room) signaling_disconnect(&g_sig);    /* TCP before WSACleanup */
     network_close(&g_net);                          /* UDP + WSACleanup last */
     if (g_encoder) codec_enc_destroy(g_encoder);
 
