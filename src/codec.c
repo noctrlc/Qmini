@@ -34,6 +34,10 @@ int codec_enc_encode(codec_enc_t *e, const short *pcm, int frame_size, uint8_t *
     return opus_encode(e->enc, pcm, frame_size, out, max_out);
 }
 
+void codec_enc_set_bitrate(codec_enc_t *e, int bitrate) {
+    opus_encoder_ctl(e->enc, OPUS_SET_BITRATE(bitrate));
+}
+
 struct codec_dec {
     OpusDecoder *dec;
 };

@@ -12,6 +12,7 @@
 #include "crypto.h"
 #include "ringbuf.h"
 #include "aec.h"
+#include "congestion.h"
 #include <windows.h>
 #include <objbase.h>
 #include <stdlib.h>
@@ -49,6 +50,7 @@ static signaling_t        g_sig;
 static codec_enc_t       *g_encoder = NULL;
 static crypto_ctx_t       g_crypto;
 aec_t                    *g_aec = NULL;
+static congestion_ctrl_t  g_cc;
 
 static uint8_t g_cap_ring_buf[CAPTURE_RING_SIZE];
 static ringbuf_t g_cap_ring;
@@ -327,8 +329,14 @@ static void process_capture(void) {
 
         was_speaking = 1;
         if (g_encoder && g_npeers > 0) {
+            /* Adaptive bitrate: adjust encoder bitrate based on congestion */
+            {
+                int br = congestion_get_bitrate(&g_cc);
+                codec_enc_set_bitrate(g_encoder, br);
+            }
             int len = codec_enc_encode(g_encoder, samples, OPUS_FRAME_SIZE, encoded, sizeof(encoded));
             if (len > 0) {
+                congestion_update_sent(&g_cc);
                 DWORD now = GetTickCount();
                 EnterCriticalSection(&g_peer_lock);
                 for (int i = 0; i < g_npeers; i++) {
@@ -521,6 +529,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
     g_aec = aec_create();
     network_init(&g_net, 0, on_network_recv, NULL);
     g_net.keepalive_cb = on_keepalive_recv;
+    congestion_init(&g_cc);
     if (!audio_capture_start(&g_capture, on_capture_frame, NULL)) {
         MessageBoxW(NULL, L"音频采集初始化失败。\n请检查麦克风设备和权限。", L"Qmini 错误", MB_OK | MB_ICONERROR);
     }
