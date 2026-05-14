@@ -12,13 +12,26 @@ static peer_t* find_peer(network_t *net, const char *id) {
     return NULL;
 }
 
+static void net_log(const char *msg) {
+    FILE *f = fopen("D:\\QminiDoctor\\sig_log.txt", "a");
+    if (f) {
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        fprintf(f, "[%02d:%02d:%02d] net_recv: %s\n", st.wHour, st.wMinute, st.wSecond, msg);
+        fclose(f);
+    }
+}
+
 static DWORD WINAPI net_recv_thread(LPVOID arg) {
     network_t *net = (network_t*)arg;
     uint8_t buf[MAX_PACKET];
     struct sockaddr_in from;
     int from_len = sizeof(from);
 
+    net_log("net_recv_thread started");
+
     while (net->running) {
+        __try {
         fd_set read_set;
         struct timeval tv = {0, 50000};
         FD_ZERO(&read_set);
@@ -42,15 +55,52 @@ static DWORD WINAPI net_recv_thread(LPVOID arg) {
             for (int i = 0; i < net->npeers; i++) {
                 if (strcmp(net->peers[i].id, peer_id) == 0) {
                     net->peers[i].addr = from;
+                    if (net->keepalive_cb)
+                        net->keepalive_cb(peer_id, net->user_data);
                     break;
                 }
             }
             continue;
         }
 
-        if (net->recv_cb)
-            net->recv_cb(peer_id, buf + 32, n - 32, net->user_data);
+        /* Data packet */
+        uint8_t *payload = buf + 32;
+        int payload_len = n - 32;
+
+        if (net->crypto && crypto_is_ready(net->crypto)) {
+            /* Find peer to get expected seq_recv */
+            peer_t *sender = NULL;
+            for (int i = 0; i < net->npeers; i++) {
+                if (strcmp(net->peers[i].id, peer_id) == 0) {
+                    sender = &net->peers[i];
+                    break;
+                }
+            }
+            if (!sender) continue;
+
+            /* Decrypt the data */
+            uint8_t decrypted[MAX_PACKET];
+            int dec_len = crypto_decrypt(net->crypto, sender->seq_recv,
+                                         payload, decrypted, payload_len);
+            if (dec_len == 0) {
+                /* Decryption failed, skip packet */
+                continue;
+            }
+            sender->seq_recv++;
+            if (net->recv_cb)
+                net->recv_cb(peer_id, decrypted, dec_len, net->user_data);
+        } else {
+            /* No encryption */
+            if (net->recv_cb)
+                net->recv_cb(peer_id, payload, payload_len, net->user_data);
+        }
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            char log_buf[128];
+            _snprintf(log_buf, sizeof(log_buf), "CRASH in net_recv_thread! code=0x%08X", GetExceptionCode());
+            net_log(log_buf);
+        }
     }
+    net_log("net_recv_thread exited");
     return 0;
 }
 
@@ -115,6 +165,7 @@ int network_add_peer(network_t *net, const char *id, const struct sockaddr_in *a
     p->addr = *addr;
     p->connected = 1;
     p->seq_send = 0;
+    p->seq_recv = 0;
     p->last_keepalive = 0;  /* send keepalive immediately */
     return 1;
 }
@@ -134,14 +185,27 @@ int network_send(network_t *net, const char *peer_id, const uint8_t *data, int l
     if (!p || !p->connected) return 0;
 
     uint8_t buf[MAX_PACKET];
-    int id_len = (int)strlen(net->local_id) + 1;
-    if (id_len > 32) id_len = 32;
+    /* Pre-built header: 32-byte local_id, zero-padded */
     memset(buf, 0, 32);
-    memcpy(buf, net->local_id, id_len - 1);
+    memcpy(buf, net->local_id, strlen(net->local_id));
 
-    int total = 32 + len;
-    if (total > MAX_PACKET) return 0;
-    memcpy(buf + 32, data, len);
+    int total;
+    if (net->crypto && crypto_is_ready(net->crypto)) {
+        /* Encrypt the data */
+        uint8_t encrypted[MAX_PACKET];
+        int enc_len = crypto_encrypt(net->crypto, p->seq_send, data, encrypted, len);
+        if (enc_len == 0) return 0;
+
+        total = 32 + enc_len + CRYPTO_HMAC_SIZE;
+        if (total > MAX_PACKET) return 0;
+        memcpy(buf + 32, encrypted, enc_len + CRYPTO_HMAC_SIZE);
+        p->seq_send++;
+    } else {
+        /* No encryption */
+        total = 32 + len;
+        if (total > MAX_PACKET) return 0;
+        memcpy(buf + 32, data, len);
+    }
 
     int sent = sendto(net->udp_sock, (const char*)buf, total, 0,
                       (struct sockaddr*)&p->addr, sizeof(p->addr));
@@ -171,13 +235,15 @@ void network_set_local_id(network_t *net, const char *id) {
     net->local_id[sizeof(net->local_id) - 1] = 0;
 }
 
+void network_set_crypto(network_t *net, crypto_ctx_t *crypto) {
+    net->crypto = crypto;
+}
+
 void network_tick(network_t *net) {
     DWORD now = GetTickCount();
     uint8_t buf[32];
-    int id_len = (int)strlen(net->local_id) + 1;
-    if (id_len > 32) id_len = 32;
     memset(buf, 0, 32);
-    memcpy(buf, net->local_id, id_len - 1);
+    memcpy(buf, net->local_id, strlen(net->local_id));
 
     for (int i = 0; i < net->npeers; i++) {
         if (net->peers[i].connected && now - net->peers[i].last_keepalive >= 3000) {

@@ -5,6 +5,8 @@
 #include <winsock2.h>
 #include <stdint.h>
 
+#include "crypto.h"
+
 #define MAX_PEERS 10
 #define MAX_PACKET 1500
 
@@ -14,6 +16,7 @@ typedef struct {
     char             id[32];
     int              connected;
     uint16_t         seq_send;
+    uint16_t         seq_recv;       /* expected next receive seq for decryption */
     DWORD            last_keepalive;  /* tick count of last keepalive sent */
 } peer_t;
 
@@ -28,6 +31,8 @@ typedef struct {
     uint16_t         seq_send;
     void             *user_data;
     void             (*recv_cb)(const char *peer_id, const uint8_t *data, int len, void *user);
+    void             (*keepalive_cb)(const char *peer_id, void *user);
+    crypto_ctx_t     *crypto;  /* NULL = no encryption */
 } network_t;
 
 int  network_init(network_t *net, uint16_t port, void (*cb)(const char*, const uint8_t*, int, void*), void *user);
@@ -43,5 +48,7 @@ void network_tick(network_t *net);
 uint16_t network_get_port(network_t *net);
 /* Override local ID to match server-assigned signaling ID for P2P packet matching */
 void network_set_local_id(network_t *net, const char *id);
+/* Set crypto context for encryption/decryption */
+void network_set_crypto(network_t *net, crypto_ctx_t *crypto);
 
 #endif
