@@ -11,6 +11,7 @@
 #include "notify.h"
 #include "crypto.h"
 #include "ringbuf.h"
+#include "aec.h"
 #include <windows.h>
 #include <objbase.h>
 #include <stdlib.h>
@@ -47,6 +48,7 @@ static network_t          g_net;
 static signaling_t        g_sig;
 static codec_enc_t       *g_encoder = NULL;
 static crypto_ctx_t       g_crypto;
+aec_t                    *g_aec = NULL;
 
 static uint8_t g_cap_ring_buf[CAPTURE_RING_SIZE];
 static ringbuf_t g_cap_ring;
@@ -516,6 +518,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
     InitializeCriticalSection(&g_sig.send_lock);
 
     audio_playback_start(&g_playback);
+    g_aec = aec_create();
     network_init(&g_net, 0, on_network_recv, NULL);
     g_net.keepalive_cb = on_keepalive_recv;
     if (!audio_capture_start(&g_capture, on_capture_frame, NULL)) {
@@ -719,6 +722,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
 
     KillTimer(g_panel.hwnd, timer_id);
     audio_capture_stop(&g_capture);
+    aec_destroy(g_aec);
+    g_aec = NULL;
     audio_playback_stop(&g_playback);
     if (g_in_room) signaling_disconnect(&g_sig);   /* TCP before WSACleanup */
     network_close(&g_net);                          /* UDP + WSACleanup last */

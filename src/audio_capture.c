@@ -1,6 +1,8 @@
 #include "audio_capture.h"
+#include "aec.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <mmsystem.h>
 #include <mmreg.h>
 
@@ -8,6 +10,10 @@
 
 #define CAPTURE_BUF_FRAMES 960   /* 60ms @ 16kHz */
 #define CAPTURE_BUF_COUNT  4
+
+extern aec_t *g_aec;
+
+static short g_aec_ref_buf[CAPTURE_BUF_FRAMES] = {0};
 
 static char g_cap_dev_name[128] = "Default";
 static HWAVEIN g_wavein = NULL;
@@ -18,6 +24,11 @@ const char* audio_capture_get_device_name(void) {
     return g_cap_dev_name;
 }
 
+void audio_capture_set_far_ref(const short *samples, int frames) {
+    int copy = frames < CAPTURE_BUF_FRAMES ? frames : CAPTURE_BUF_FRAMES;
+    memcpy(g_aec_ref_buf, samples, copy * sizeof(short));
+}
+
 static void CALLBACK wavein_cb(HWAVEIN hwi, UINT msg, DWORD_PTR inst, DWORD_PTR param1, DWORD_PTR param2) {
     (void)hwi; (void)param2;
     if (msg != WIM_DATA) return;
@@ -25,10 +36,22 @@ static void CALLBACK wavein_cb(HWAVEIN hwi, UINT msg, DWORD_PTR inst, DWORD_PTR 
     if (!ac || !ac->running || !ac->callback) return;
 
     WAVEHDR *hdr = (WAVEHDR*)param1;
-
-    /* Callback with the captured samples */
+    short *buf = (short*)hdr->lpData;
     int frames = hdr->dwBytesRecorded / sizeof(short);
-    ac->callback((const short*)hdr->lpData, frames, ac->user_data);
+
+    /* Apply AEC if available: process in AEC_FRAME_SIZE (160-sample) chunks */
+    if (g_aec && frames >= AEC_FRAME_SIZE) {
+        short near_out[AEC_FRAME_SIZE];
+        int pos = 0;
+        while (pos + AEC_FRAME_SIZE <= frames) {
+            aec_process(g_aec, buf + pos, g_aec_ref_buf + pos, near_out);
+            memcpy(buf + pos, near_out, AEC_FRAME_SIZE * sizeof(short));
+            pos += AEC_FRAME_SIZE;
+        }
+    }
+
+    /* Callback with the (echo-cancelled) samples */
+    ac->callback((const short*)buf, frames, ac->user_data);
 
     /* Re-queue the buffer */
     waveInAddBuffer(g_wavein, hdr, sizeof(WAVEHDR));

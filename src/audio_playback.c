@@ -18,6 +18,7 @@ static volatile int   g_buf_ready[PLAY_BUF_COUNT]; /* 1=in queue, 0=available */
 static audio_playback_t *g_play_ap = NULL;
 static HANDLE         g_play_thread = NULL;
 static volatile int   g_play_thread_run = 0;
+static volatile int   g_stopping = 0;
 
 const char* audio_playback_get_device_name(void) {
     return g_play_dev_name;
@@ -26,9 +27,11 @@ const char* audio_playback_get_device_name(void) {
 static DWORD WINAPI play_thread(LPVOID arg) {
     audio_playback_t *ap = (audio_playback_t*)arg;
     while (g_play_thread_run) {
+        __try {
+        if (g_stopping) { Sleep(10); continue; }
         int wrote = 0;
         for (int i = 0; i < PLAY_BUF_COUNT; i++) {
-            if (!g_buf_ready[i]) {
+            if (!g_stopping && !g_buf_ready[i] && g_waveout) {
                 /* Fill this buffer from ring buffer */
                 short *buf = g_wavebuf[i];
                 int any_data = 0;
@@ -44,17 +47,26 @@ static DWORD WINAPI play_thread(LPVOID arg) {
                         buf[j] = 0;
                     }
                 }
-                /* Only write if we're already playing (first write starts playback) */
                 g_buf_ready[i] = 1;
-                /* Re-prepare header (WHDR_PREPARED is cleared by driver on WOM_DONE) */
                 waveOutPrepareHeader(g_waveout, &g_wavehdr[i], sizeof(WAVEHDR));
                 waveOutWrite(g_waveout, &g_wavehdr[i], sizeof(WAVEHDR));
                 wrote = 1;
             }
         }
         if (!wrote) {
-            /* All buffers in queue, wait for WOM_DONE by sleeping briefly */
             Sleep(5);
+        }
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            /* Log and continue — don't kill the playback thread */
+            FILE *f = fopen("D:\\QminiDoctor\\sig_log.txt", "a");
+            if (f) {
+                SYSTEMTIME st;
+                GetLocalTime(&st);
+                fprintf(f, "[%02d:%02d:%02d] CRASH in play_thread! code=0x%08X\n",
+                        st.wHour, st.wMinute, st.wSecond, GetExceptionCode());
+                fclose(f);
+            }
+            Sleep(10);
         }
     }
     return 0;
@@ -63,6 +75,8 @@ static DWORD WINAPI play_thread(LPVOID arg) {
 static void CALLBACK waveout_cb(HWAVEOUT hwo, UINT msg, DWORD_PTR inst, DWORD_PTR param1, DWORD_PTR param2) {
     (void)hwo; (void)inst; (void)param2;
     if (msg != WOM_DONE) return;
+    __try {
+    if (g_stopping) return;
     /* Mark this buffer as available */
     for (int i = 0; i < PLAY_BUF_COUNT; i++) {
         if (&g_wavehdr[i] == (WAVEHDR*)param1) {
@@ -70,9 +84,15 @@ static void CALLBACK waveout_cb(HWAVEOUT hwo, UINT msg, DWORD_PTR inst, DWORD_PT
             break;
         }
     }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        /* Silently ignore — can't log from driver callback safely */
+    }
 }
 
+extern void audio_capture_set_far_ref(const short *samples, int frames);
+
 void audio_playback_submit(audio_playback_t *ap, const short *samples, int frames) {
+    audio_capture_set_far_ref(samples, frames);
     for (int i = 0; i < frames; i++) {
         LONG head = ap->rb_head;
         LONG tail = ap->rb_tail;
@@ -130,6 +150,7 @@ int audio_playback_start(audio_playback_t *ap) {
 }
 
 void audio_playback_stop(audio_playback_t *ap) {
+    g_stopping = 1;           /* signal play_thread to stop using waveOut */
     g_play_thread_run = 0;
     if (g_play_thread) {
         WaitForSingleObject(g_play_thread, 3000);
@@ -146,6 +167,7 @@ void audio_playback_stop(audio_playback_t *ap) {
         waveOutClose(g_waveout);
         g_waveout = NULL;
     }
+    g_stopping = 0;
     if (ap->mix_buf) {
         HeapFree(GetProcessHeap(), 0, ap->mix_buf);
         ap->mix_buf = NULL;
