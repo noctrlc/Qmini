@@ -9,6 +9,8 @@ typedef struct {
     int   room_max;
     char *nickname;
     int   nickname_max;
+    char *password;
+    int   password_max;
 } join_ctx_t;
 
 static INT_PTR CALLBACK join_dlg_proc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -20,6 +22,7 @@ static INT_PTR CALLBACK join_dlg_proc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM
         SetDlgItemTextW(hDlg, IDC_SERVER_LABEL, L"服务器:");
         SetDlgItemTextW(hDlg, IDC_ROOM_LABEL, L"房间名:");
         SetDlgItemTextW(hDlg, IDC_NICKNAME_LABEL, L"昵称:");
+        SetDlgItemTextW(hDlg, IDC_PASSWORD_LABEL, L"密码:");
         SetDlgItemTextW(hDlg, IDOK, L"确定");
         SetDlgItemTextW(hDlg, IDCANCEL, L"取消");
         SetDlgItemTextA(hDlg, IDC_SERVER, ctx->server);
@@ -33,6 +36,7 @@ static INT_PTR CALLBACK join_dlg_proc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM
             GetDlgItemTextA(hDlg, IDC_SERVER, ctx->server, ctx->server_max);
             GetDlgItemTextA(hDlg, IDC_ROOM, ctx->room, ctx->room_max);
             GetDlgItemTextA(hDlg, IDC_NICKNAME, ctx->nickname, ctx->nickname_max);
+            GetDlgItemTextA(hDlg, IDC_PASSWORD, ctx->password, ctx->password_max);
             EndDialog(hDlg, 1);
             return TRUE;
         }
@@ -48,14 +52,17 @@ static INT_PTR CALLBACK join_dlg_proc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM
 int join_dialog_show(HINSTANCE inst, HWND parent,
                      char *server, int server_max,
                      char *room, int room_max,
-                     char *nickname, int nickname_max) {
+                     char *nickname, int nickname_max,
+                     char *password, int password_max) {
     join_ctx_t ctx;
-    ctx.server      = server;
-    ctx.server_max  = server_max;
-    ctx.room        = room;
-    ctx.room_max    = room_max;
-    ctx.nickname    = nickname;
+    ctx.server       = server;
+    ctx.server_max   = server_max;
+    ctx.room         = room;
+    ctx.room_max     = room_max;
+    ctx.nickname     = nickname;
     ctx.nickname_max = nickname_max;
+    ctx.password     = password;
+    ctx.password_max = password_max;
 
     return (int)DialogBoxParamW(inst, MAKEINTRESOURCEW(IDD_JOIN_DIALOG),
                                 parent, join_dlg_proc, (LPARAM)&ctx);
