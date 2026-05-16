@@ -712,40 +712,35 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
                     char room[32] = "default";
                     char nick[32] = {0};
                     char password[64] = {0};
+                    strncpy(server, g_cfg.server_addr, sizeof(server) - 1);
+                    strncpy(nick, g_cfg.nickname, sizeof(nick) - 1);
 
-                    /* Read from panel inline join form */
-                    const char *ps = panel_get_join_server();
-                    const char *pr = panel_get_join_room();
-                    const char *pn = panel_get_join_nick();
-                    const char *pp = panel_get_join_pass();
-                    if (ps && ps[0]) strncpy(server, ps, sizeof(server) - 1);
-                    else strncpy(server, g_cfg.server_addr, sizeof(server) - 1);
-                    if (pr && pr[0]) strncpy(room, pr, sizeof(room) - 1);
-                    if (pn && pn[0]) strncpy(nick, pn, sizeof(nick) - 1);
-                    else strncpy(nick, g_cfg.nickname, sizeof(nick) - 1);
-                    if (pp && pp[0]) strncpy(password, pp, sizeof(password) - 1);
+                    if (join_dialog_show(g_panel.inst, g_panel.hwnd,
+                                         server, sizeof(server),
+                                         room, sizeof(room),
+                                         nick, sizeof(nick),
+                                         password, sizeof(password))) {
+                        /* Initialize encryption from password */
+                        if (password[0]) {
+                            crypto_init_from_password(&g_crypto, password);
+                            network_set_crypto(&g_net, &g_crypto);
+                        }
 
-                    /* Initialize encryption from password */
-                    if (password[0]) {
-                        crypto_init_from_password(&g_crypto, password);
-                        network_set_crypto(&g_net, &g_crypto);
-                    }
+                        join_params_t *jp = (join_params_t*)malloc(sizeof(join_params_t));
+                        if (!jp) continue;
+                        memset(jp, 0, sizeof(*jp));
+                        if (sscanf(server, "%63[^:]:%d", jp->host, &jp->port) < 2)
+                            jp->port = 9088;
+                        strncpy(jp->room, room, sizeof(jp->room) - 1);
+                        strncpy(jp->nick, nick, sizeof(jp->nick) - 1);
+                        jp->sig_port = network_get_port(&g_net);
 
-                    join_params_t *jp = (join_params_t*)malloc(sizeof(join_params_t));
-                    if (!jp) continue;
-                    memset(jp, 0, sizeof(*jp));
-                    if (sscanf(server, "%63[^:]:%d", jp->host, &jp->port) < 2)
-                        jp->port = 9088;
-                    strncpy(jp->room, room, sizeof(jp->room) - 1);
-                    strncpy(jp->nick, nick, sizeof(jp->nick) - 1);
-                    jp->sig_port = network_get_port(&g_net);
-
-                    /* Set callbacks before connect: server may send PEER_JOIN immediately */
-                    g_sig.peer_join_cb = on_peer_join;
-                    g_sig.peer_leave_cb = on_peer_leave;
-                    g_sig.ice_cb = on_ice_msg;
-                    g_sig.relay_cb = on_relay_recv;
-                    g_sig.user_data = NULL;
+                        /* Set callbacks before connect: server may send PEER_JOIN immediately */
+                        g_sig.peer_join_cb = on_peer_join;
+                        g_sig.peer_leave_cb = on_peer_leave;
+                        g_sig.ice_cb = on_ice_msg;
+                        g_sig.relay_cb = on_relay_recv;
+                        g_sig.user_data = NULL;
 
                         /* Save config so UI reflects intent */
                         strncpy(g_cfg.server_addr, server, sizeof(g_cfg.server_addr) - 1);
@@ -761,6 +756,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
                         g_connecting = 1;
                         HANDLE h = CreateThread(NULL, 0, join_thread, jp, 0, NULL);
                         CloseHandle(h);
+                    }
                 }
             } else if (cmd_id == TRAY_CMD_LEAVE_ROOM) {
                 if (g_connecting) {
