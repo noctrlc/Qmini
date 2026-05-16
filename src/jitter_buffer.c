@@ -6,8 +6,8 @@
 
 void jitter_buffer_init(jitter_buffer_t *jb) {
     memset(jb, 0, sizeof(*jb));
-    jb->target_level    = 4;        /* Initial 4 packets */
-    jb->min_target      = 2;        /* Minimum 2 packets */
+    jb->target_level    = 2;        /* Initial 2 packets (40ms) */
+    jb->min_target      = 1;        /* Minimum 1 packet (20ms) */
     jb->max_target      = 12;       /* Maximum 12 packets */
     jb->jitter_avg      = 20;       /* Initial estimate 20ms */
     jb->jitter_variance = 0;
@@ -16,17 +16,14 @@ void jitter_buffer_init(jitter_buffer_t *jb) {
 }
 
 void jitter_buffer_destroy(jitter_buffer_t *jb) {
-    for (int i = 0; i < JB_CAPACITY; i++) {
-        if (jb->packets[i]) {
-            free(jb->packets[i]);
-            jb->packets[i] = NULL;
-        }
-    }
+    /* Inline data: no heap cleanup needed, just zero state */
     memset(jb, 0, sizeof(*jb));
 }
 
-void jitter_buffer_push(jitter_buffer_t *jb, const uint8_t *data, int size, uint16_t seq) {
+void jitter_buffer_push(jitter_buffer_t *jb, const uint8_t *src, int size, uint16_t seq) {
     if (jb->count >= JB_CAPACITY) return;
+    if (size > JB_MAX_PACKET) size = JB_MAX_PACKET;
+    if (size <= 0) return;
 
     /* --- Adaptive jitter estimation --- */
     uint32_t now = GetTickCount();
@@ -55,30 +52,22 @@ void jitter_buffer_push(jitter_buffer_t *jb, const uint8_t *data, int size, uint
     }
     /* --- End adaptive jitter --- */
 
-    int idx = (jb->read_cursor + jb->count) & 0x7F;
-    uint8_t *p = (uint8_t*)malloc(size);
-    if (!p) return;
-    memcpy(p, data, size);
-    if (jb->packets[idx]) free(jb->packets[idx]);
-    jb->packets[idx]      = p;
-    jb->sizes[idx]        = size;
-    jb->seq_numbers[idx]  = seq;
+    int idx = (jb->read_cursor + jb->count) & (JB_CAPACITY - 1);
+    memcpy(jb->data[idx], src, size);
+    jb->sizes[idx]       = size;
+    jb->seq_numbers[idx] = seq;
     jb->count++;
 }
 
-int jitter_buffer_pop(jitter_buffer_t *jb, uint8_t *data, uint16_t *seq) {
+int jitter_buffer_pop(jitter_buffer_t *jb, uint8_t *dst, uint16_t *seq) {
     if (jb->count == 0) return 0;
     if (jb->count <= jb->target_level) return 0;
 
-    int idx = jb->read_cursor & 0x7F;
-    if (!jb->packets[idx]) return 0;
-
+    int idx = jb->read_cursor & (JB_CAPACITY - 1);
     int size = jb->sizes[idx];
-    memcpy(data, jb->packets[idx], size);
+    memcpy(dst, jb->data[idx], size);
     if (seq) *seq = jb->seq_numbers[idx];
 
-    free(jb->packets[idx]);
-    jb->packets[idx] = NULL;
     jb->read_cursor++;
     jb->count--;
     return size;

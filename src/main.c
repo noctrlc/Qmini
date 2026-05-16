@@ -16,6 +16,7 @@
 #include "ns.h"
 #include "congestion.h"
 #include "sfu_client.h"
+#include "logger.h"
 #include <windows.h>
 #include <objbase.h>
 #include <stdlib.h>
@@ -40,6 +41,7 @@ typedef struct {
     char room[32];
     char nick[32];
     int  sig_port;
+    int  error_code;  /* sig_result_t */
 } join_params_t;
 
 /* --- Global state --- */
@@ -52,10 +54,9 @@ static network_t          g_net;
 static signaling_t        g_sig;
 static codec_enc_t       *g_encoder = NULL;
 static crypto_ctx_t       g_crypto;
-aec_t                    *g_aec = NULL;
-agc_t                    *g_agc = NULL;
-ns_t                     *g_ns = NULL;
-static congestion_ctrl_t  g_cc;
+static aec_t             *g_aec = NULL;
+static agc_t             *g_agc = NULL;
+static ns_t              *g_ns = NULL;
 
 /* SFU mode globals */
 static sfu_client_t       g_sfu;
@@ -76,6 +77,8 @@ typedef struct {
     DWORD           joined_time;    /* GetTickCount when peer was added */
     DWORD           last_udp_recv;  /* 0 = never received UDP from this peer */
     int             use_relay;      /* 1 = send via TCP relay */
+    peer_cc_t       cc;             /* per-peer congestion control */
+    float           gain;           /* volume multiplier, default 1.0 */
 } peer_state_t;
 
 static peer_state_t g_peers[MAX_PEERS];
@@ -143,6 +146,7 @@ static void on_network_recv(const char *peer_id, const uint8_t *data, int len, v
             g_peers[i].last_udp_recv = GetTickCount();
             g_peers[i].use_relay = 0;  /* UDP is working, disable relay */
             jitter_buffer_push(&g_peers[i].jb, data, len, 0);
+            peer_cc_update_acked(&g_peers[i].cc, 0);
             break;
         }
     }
@@ -168,6 +172,7 @@ static void on_relay_recv(const char *from_id, const uint8_t *data, int len, voi
     for (int i = 0; i < g_npeers; i++) {
         if (strcmp(g_peers[i].id, from_id) == 0) {
             jitter_buffer_push(&g_peers[i].jb, data, len, 0);
+            peer_cc_update_acked(&g_peers[i].cc, 0);
             break;
         }
     }
@@ -182,6 +187,7 @@ static void on_sfu_recv(const char *peer_id, const uint8_t *data, int len, void 
             g_peers[i].last_udp_recv = GetTickCount();
             g_peers[i].use_relay = 0;  /* SFU is working */
             jitter_buffer_push(&g_peers[i].jb, data, len, 0);
+            peer_cc_update_acked(&g_peers[i].cc, 0);
             break;
         }
     }
@@ -221,7 +227,9 @@ static void on_peer_join(const char *peer_id, const char *nickname, struct socka
     ps->active = 1;
     ps->joined_time = GetTickCount();
     ps->last_udp_recv = 0;
-    ps->use_relay = 0;  /* start with UDP, switch to relay if needed */
+    ps->use_relay = 0;
+    ps->gain = (float)g_cfg.peer_gain / 100.0f;
+    peer_cc_init(&ps->cc);
     ps->speaker.buffer = (short*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, SPEAKER_BUF_FRAMES * sizeof(short));
     ps->speaker.capacity = SPEAKER_BUF_FRAMES;
     ps->speaker.frames = 0;
@@ -266,6 +274,25 @@ static void on_ice_msg(const char *from_id, const char *sdp, void *user) {
     (void)user; (void)from_id; (void)sdp;
 }
 
+/* --- Adaptive noise floor state --- */
+#define NG_WINDOW_SECONDS 5
+#define NG_WINDOW_FRAMES  ((NG_WINDOW_SECONDS * 1000) / 20)
+
+static long long ng_history[NG_WINDOW_FRAMES];
+static int       ng_hist_pos = 0;
+static int       ng_hist_count = 0;
+static long long ng_ambient_rms_sq = 67600;
+
+static long long ng_update_ambient(long long rms_sq) {
+    ng_history[ng_hist_pos] = rms_sq;
+    ng_hist_pos = (ng_hist_pos + 1) % NG_WINDOW_FRAMES;
+    if (ng_hist_count < NG_WINDOW_FRAMES) ng_hist_count++;
+    long long min_val = ng_history[0];
+    for (int i = 1; i < ng_hist_count; i++)
+        if (ng_history[i] < min_val) min_val = ng_history[i];
+    return min_val;
+}
+
 /* --- Audio processing --- */
 
 static DWORD WINAPI join_thread(LPVOID arg) {
@@ -283,6 +310,7 @@ static DWORD WINAPI join_thread(LPVOID arg) {
             HeapFree(GetProcessHeap(), 0, g_peers[i].speaker.buffer);
     }
     g_npeers = 0;
+    g_net.npeers = 0;  /* clear stale network peers */
     LeaveCriticalSection(&g_peer_lock);
 
     int ok = signaling_connect(&g_sig, jp->host, jp->port, jp->room, jp->nick, jp->sig_port, g_net.udp_sock);
@@ -297,27 +325,23 @@ static DWORD WINAPI join_thread(LPVOID arg) {
     }
 
     if (ok) {
+        jp->error_code = SIG_OK;
         /* Sync P2P packet ID with server-assigned signaling ID */
         network_set_local_id(&g_net, g_sig.local_id);
 
         /* Initialize SFU client for large-room relay mode */
         sfu_init(&g_sfu, jp->host, SFU_RELAY_PORT, on_sfu_recv, NULL);
         sfu_set_local_id(&g_sfu, g_sig.local_id);
-        /* Send HELLO to establish UDP mapping with SFU relay server */
-        for (int i = 0; i < 3; i++) {
-            sfu_send_hello(&g_sfu);
-            Sleep(50);
-        }
+        sfu_send_hello(&g_sfu);  /* establish UDP mapping (single shot, no delay) */
 
         PostMessageW(hwnd, WM_JOIN_RESULT, 1, (LPARAM)jp);
     } else {
+        jp->error_code = g_sig.last_error;
         PostMessageW(hwnd, WM_JOIN_RESULT, 0, (LPARAM)jp);
     }
     g_connecting = 0;
     return 0;
 }
-
-static void log_playback_msg(const char *msg);
 
 static void process_capture(void) {
     short samples[OPUS_FRAME_SIZE];
@@ -325,15 +349,14 @@ static void process_capture(void) {
     static float dc_state = 0.0f;
     static int noise_gate_frames = 0;
     static int was_speaking = 0;
-    /* RMS^2 threshold: (260)^2 = 67600 */
-    const int NOISE_FLOOR_SQ = 67600;
+    int lock_held = 0;
 
     __try {
     while (ringbuf_avail(&g_cap_ring) >= sizeof(samples)) {
         size_t n = ringbuf_pop(&g_cap_ring, (uint8_t*)samples, sizeof(samples));
         if (n < sizeof(samples)) break;
 
-        /* DC offset removal (first-order high-pass, fc ~20Hz @16kHz) */
+        /* DC offset removal */
         for (int i = 0; i < OPUS_FRAME_SIZE; i++) {
             float x = (float)samples[i];
             float y = x - dc_state;
@@ -341,7 +364,7 @@ static void process_capture(void) {
             samples[i] = (short)(y > 32767 ? 32767 : (y < -32768 ? -32768 : y));
         }
 
-        /* Noise gate: compare RMS^2 directly (avoid sqrt) */
+        /* RMS^2 for noise gate */
         long long rms_sq = 0;
         for (int i = 0; i < OPUS_FRAME_SIZE; i++) {
             long long s = samples[i];
@@ -349,45 +372,41 @@ static void process_capture(void) {
         }
         rms_sq /= OPUS_FRAME_SIZE;
 
-        if (rms_sq >= NOISE_FLOOR_SQ) {
-            noise_gate_frames = 10;  /* hold open for 10 frames (200ms) */
+        /* Adaptive noise floor */
+        ng_ambient_rms_sq = ng_update_ambient(rms_sq);
+        long long threshold = ng_ambient_rms_sq *
+            (g_cfg.noise_gate_mult * g_cfg.noise_gate_mult) / 100;
+        if (threshold < 100) threshold = 100;  /* floor at ~-70dBFS */
+
+        int hold_frames = g_cfg.noise_gate_hold_ms / 20;
+        if (hold_frames < 1) hold_frames = 1;
+
+        if (rms_sq >= threshold) {
+            noise_gate_frames = hold_frames;
         } else if (noise_gate_frames > 0) {
             noise_gate_frames--;
         } else {
-            /* Send DTX silence packet once when speech ends */
-            if (was_speaking && g_encoder && g_npeers > 0) {
-                int len = codec_enc_encode(g_encoder, NULL, OPUS_FRAME_SIZE, encoded, sizeof(encoded));
-                if (len > 0) {
-                    EnterCriticalSection(&g_peer_lock);
-                    if (g_sfu_mode) {
-                        sfu_send(&g_sfu, encoded, len);
-                    } else {
-                        for (int i = 0; i < g_npeers; i++) {
-                            if (!g_peers[i].active) continue;
-                            if (g_peers[i].use_relay)
-                                signaling_send_relay(&g_sig, g_peers[i].id, encoded, len);
-                            else
-                                network_send(&g_net, g_peers[i].id, encoded, len);
-                        }
-                    }
-                    LeaveCriticalSection(&g_peer_lock);
-                }
-                was_speaking = 0;
-            }
-            continue;
+            was_speaking = 0;
+            continue;  /* silence: skip encode/send, rely on Opus DTX */
         }
 
         was_speaking = 1;
         if (g_encoder && g_npeers > 0) {
-            /* Adaptive bitrate: adjust encoder bitrate based on congestion */
+            /* Adaptive bitrate: use worst-case peer to avoid starving any link */
             {
-                int br = congestion_get_bitrate(&g_cc);
-                codec_enc_set_bitrate(g_encoder, br);
+                int min_br = CC_BITRATE_MAX;
+                for (int i = 0; i < g_npeers; i++) {
+                    int br = peer_cc_get_bitrate(&g_peers[i].cc);
+                    if (br < min_br) min_br = br;
+                }
+                codec_enc_set_bitrate(g_encoder, min_br);
             }
             int len = codec_enc_encode(g_encoder, samples, OPUS_FRAME_SIZE, encoded, sizeof(encoded));
             if (len > 0) {
-                congestion_update_sent(&g_cc);
+                for (int i = 0; i < g_npeers; i++)
+                    peer_cc_update_sent(&g_peers[i].cc);
                 EnterCriticalSection(&g_peer_lock);
+                lock_held = 1;
                 if (g_sfu_mode) {
                     /* SFU mode: single send to server, server relays to all peers */
                     sfu_send(&g_sfu, encoded, len);
@@ -412,19 +431,16 @@ static void process_capture(void) {
                     }
                 }
                 LeaveCriticalSection(&g_peer_lock);
+                lock_held = 0;
             }
         }
     }
     } __except(EXCEPTION_EXECUTE_HANDLER) {
+        if (lock_held) LeaveCriticalSection(&g_peer_lock);
         char log_buf[128];
         _snprintf(log_buf, sizeof(log_buf), "CRASH in process_capture! code=0x%08X", GetExceptionCode());
-        log_playback_msg(log_buf);
+        LOG_ERROR("%s", log_buf);
     }
-}
-
-static void log_playback_msg(const char *msg) {
-    FILE *f = fopen("D:\\QminiDoctor\\sig_log.txt", "a");
-    if (f) { fprintf(f, "[playback] %s\n", msg); fclose(f); }
 }
 
 static void process_playback(void) {
@@ -440,8 +456,8 @@ static void process_playback(void) {
         while (g_peers[i].speaker.frames + OPUS_FRAME_SIZE <= g_peers[i].speaker.capacity) {
             int sz = jitter_buffer_pop(&g_peers[i].jb, data, NULL);
             if (sz <= 0) break;
+            if (sz > JB_MAX_PACKET) break;  /* safety: oversized packet */
 
-            if (sz < 1 || sz > 400) break;
             int dst_idx = (g_peers[i].speaker.read_pos + g_peers[i].speaker.frames) & SPEAKER_BUF_MASK;
             int frames = codec_dec_decode(g_peers[i].dec, data, sz, pcm, OPUS_FRAME_SIZE, 1);
             if (frames > 0 && frames <= OPUS_FRAME_SIZE) {
@@ -467,7 +483,10 @@ static void process_playback(void) {
                 int sum = 0;
                 for (int j = 0; j < g_npeers; j++) {
                     if (g_peers[j].active && g_peers[j].speaker.buffer && g_peers[j].speaker.frames > 0) {
-                        sum += g_peers[j].speaker.buffer[g_peers[j].speaker.read_pos];
+                        float s = (float)g_peers[j].speaker.buffer[g_peers[j].speaker.read_pos] * g_peers[j].gain;
+                        if (s > 32767.0f) s = 32767.0f;
+                        if (s < -32768.0f) s = -32768.0f;
+                        sum += (int)s;
                         g_peers[j].speaker.read_pos = (g_peers[j].speaker.read_pos + 1) & SPEAKER_BUF_MASK;
                         g_peers[j].speaker.frames--;
                     }
@@ -481,9 +500,10 @@ static void process_playback(void) {
     }
     LeaveCriticalSection(&g_peer_lock);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
+        LeaveCriticalSection(&g_peer_lock);
         char log_buf[128];
         _snprintf(log_buf, sizeof(log_buf), "CRASH in process_playback! code=0x%08X", GetExceptionCode());
-        log_playback_msg(log_buf);
+        LOG_ERROR("%s", log_buf);
         for (int i = 0; i < g_npeers; i++) {
             g_peers[i].speaker.frames = 0;
             g_peers[i].speaker.read_pos = 0;
@@ -516,6 +536,7 @@ static void CALLBACK process_timer(HWND hwnd, UINT msg, UINT_PTR id, DWORD time)
             }
             g_npeers = 0;
             LeaveCriticalSection(&g_peer_lock);
+            g_net.npeers = 0;
             signaling_disconnect(&g_sig);
             g_in_room = 0;
             panel_set_members(&g_panel, NULL, 0);
@@ -568,6 +589,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
     /* Wrap in SEH to catch and report crashes */
     __try {
 
+    log_init(NULL);
+    LOG_INFO("Qmini starting");
     config_load(&g_cfg);
 
     if (!panel_create(&g_panel, inst)) {
@@ -579,6 +602,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
     hotkey_init(&g_hk, g_panel.hwnd, g_cfg.ptt_key, g_cfg.mute_key);
 
     g_encoder = codec_enc_create(16000, 1);
+    codec_enc_set_fec(g_encoder, g_cfg.enable_fec);
+    codec_enc_set_bitrate(g_encoder, CC_BITRATE_MAX);
     ringbuf_init(&g_cap_ring, g_cap_ring_buf, CAPTURE_RING_SIZE);
     InitializeCriticalSection(&g_peer_lock);
     InitializeCriticalSection(&g_sig.send_lock);
@@ -587,14 +612,15 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
     g_aec = aec_create();
     g_ns = ns_create(16000);
     g_agc = agc_create(16000, -20);
+    audio_capture_set_pipeline(&g_capture, g_aec, g_agc, g_ns);
+    audio_playback_set_capture(&g_playback, &g_capture);
     network_init(&g_net, 0, on_network_recv, NULL);
     g_net.keepalive_cb = on_keepalive_recv;
-    congestion_init(&g_cc);
     if (!audio_capture_start(&g_capture, on_capture_frame, NULL)) {
         MessageBoxW(NULL, L"音频采集初始化失败。\n请检查麦克风设备和权限。", L"Qmini 错误", MB_OK | MB_ICONERROR);
     }
 
-    UINT_PTR timer_id = SetTimer(g_panel.hwnd, 1, 20, process_timer);
+    UINT_PTR timer_id = SetTimer(g_panel.hwnd, 1, 10, process_timer);
 
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0)) {
@@ -610,15 +636,27 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
                 update_member_list();
                 panel_set_connection(&g_panel, g_svr, g_rm);
             } else if (jp) {
-                wchar_t werr[256];
-                _snwprintf(werr, 256,
-                    L"连接信令服务器失败。\n\n"
-                    L"服务器: %hs:%d\n"
-                    L"房间: %hs\n"
-                    L"本机 UDP 端口: %d\n\n"
-                    L"请检查服务器地址和服务器是否正在运行。",
-                    jp->host, jp->port, jp->room, jp->sig_port);
-                MessageBoxW(NULL, werr, L"Qmini 连接失败", MB_OK | MB_ICONERROR);
+                const wchar_t *msg;
+                switch (jp->error_code) {
+                    case SIG_ERR_SOCKET:      msg = L"创建套接字失败。\n请检查系统网络配置。"; break;
+                    case SIG_ERR_CONNECT:     msg = L"无法连接到信令服务器。\n请检查服务器地址是否正确、服务器是否正在运行。"; break;
+                    case SIG_ERR_TIMEOUT:     msg = L"连接服务器超时(5秒)。\n请检查服务器地址和网络是否可达。"; break;
+                    case SIG_ERR_NO_RESPONSE: msg = L"服务器无响应。\n请确认服务器程序正在运行。"; break;
+                    case SIG_ERR_REGISTER:    msg = L"服务器拒绝注册。\n请检查房间名或服务器配置。"; break;
+                    default: {
+                        wchar_t werr[256];
+                        _snwprintf(werr, 256,
+                            L"连接信令服务器失败。\n\n"
+                            L"服务器: %hs:%d\n"
+                            L"房间: %hs\n"
+                            L"本机 UDP 端口: %d\n\n"
+                            L"请检查服务器地址和服务器是否正在运行。",
+                            jp->host, jp->port, jp->room, jp->sig_port);
+                        msg = werr;
+                        break;
+                    }
+                }
+                MessageBoxW(NULL, msg, L"Qmini 连接失败", MB_OK | MB_ICONERROR);
                 g_svr[0] = 0;
                 g_rm[0] = 0;
                 panel_set_connection(&g_panel, "", "");
@@ -748,6 +786,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
                     LeaveCriticalSection(&g_peer_lock);
 
                     signaling_disconnect(&g_sig);
+                    g_net.npeers = 0;  /* clear stale network peer list */
                     g_in_room = 0;
                     g_svr[0] = 0;
                     g_rm[0] = 0;
@@ -822,6 +861,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
     hotkey_destroy(&g_hk);
     panel_destroy(&g_panel);
     notify_shutdown(NULL, NULL);
+    LOG_INFO("Qmini shutdown");
+    log_shutdown();
     return 0;
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         MessageBoxW(NULL, L"Qmini 遇到错误，需要关闭。", L"Qmini 错误", MB_OK | MB_ICONERROR);

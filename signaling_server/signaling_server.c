@@ -12,6 +12,7 @@
 
 #include <winsock2.h>
 #include <windows.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -260,6 +261,21 @@ static DWORD WINAPI client_thread(LPVOID arg) {
 
                 client_t *c = find_client(s);
                 if (!c) continue;
+
+                /* Remove any stale entries with same nick+room (reconnect scenario) */
+                for (int j = 0; j < MAX_CLIENTS; j++) {
+                    if (g_clients[j].active && g_clients[j].sock != s &&
+                        strcmp(g_clients[j].nickname, nick) == 0 &&
+                        strcmp(g_clients[j].room, room) == 0) {
+                        LOG("Removing stale duplicate: id=%s nick=%s room=%s",
+                            g_clients[j].id, nick, room);
+                        broadcast_room(room, g_clients[j].sock,
+                                       "PEER_LEAVE %s", g_clients[j].id);
+                        closesocket(g_clients[j].sock);
+                        g_clients[j].active = 0;
+                        g_clients[j].udp_known = 0;
+                    }
+                }
 
                 char id[MAX_ID];
                 _snprintf(id, sizeof(id), "user%d", g_next_id++);

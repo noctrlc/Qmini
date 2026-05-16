@@ -1,4 +1,5 @@
 #include "network.h"
+#include "logger.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -12,23 +13,13 @@ static peer_t* find_peer(network_t *net, const char *id) {
     return NULL;
 }
 
-static void net_log(const char *msg) {
-    FILE *f = fopen("D:\\QminiDoctor\\sig_log.txt", "a");
-    if (f) {
-        SYSTEMTIME st;
-        GetLocalTime(&st);
-        fprintf(f, "[%02d:%02d:%02d] net_recv: %s\n", st.wHour, st.wMinute, st.wSecond, msg);
-        fclose(f);
-    }
-}
-
 static DWORD WINAPI net_recv_thread(LPVOID arg) {
     network_t *net = (network_t*)arg;
     uint8_t buf[MAX_PACKET];
     struct sockaddr_in from;
     int from_len = sizeof(from);
 
-    net_log("net_recv_thread started");
+    LOG_INFO("net_recv_thread started");
 
     while (net->running) {
         __try {
@@ -67,7 +58,10 @@ static DWORD WINAPI net_recv_thread(LPVOID arg) {
         uint8_t *payload = buf + 32;
         int payload_len = n - 32;
 
-        if (net->crypto && crypto_is_ready(net->crypto)) {
+        if (net->crypto) {
+            if (!crypto_is_ready(net->crypto)) {
+                continue;  /* crypto set but not initialized — drop to avoid garbage */
+            }
             /* Find peer to get expected seq_recv */
             peer_t *sender = NULL;
             for (int i = 0; i < net->npeers; i++) {
@@ -97,10 +91,10 @@ static DWORD WINAPI net_recv_thread(LPVOID arg) {
         } __except(EXCEPTION_EXECUTE_HANDLER) {
             char log_buf[128];
             _snprintf(log_buf, sizeof(log_buf), "CRASH in net_recv_thread! code=0x%08X", GetExceptionCode());
-            net_log(log_buf);
+            LOG_ERROR("%s", log_buf);
         }
     }
-    net_log("net_recv_thread exited");
+    LOG_INFO("net_recv_thread exited");
     return 0;
 }
 

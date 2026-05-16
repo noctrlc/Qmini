@@ -38,6 +38,10 @@ void codec_enc_set_bitrate(codec_enc_t *e, int bitrate) {
     opus_encoder_ctl(e->enc, OPUS_SET_BITRATE(bitrate));
 }
 
+void codec_enc_set_fec(codec_enc_t *e, int enable) {
+    opus_encoder_ctl(e->enc, OPUS_SET_INBAND_FEC(enable ? 1 : 0));
+}
+
 struct codec_dec {
     OpusDecoder *dec;
 };

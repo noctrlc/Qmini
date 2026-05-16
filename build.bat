@@ -70,7 +70,7 @@ if %ERRORLEVEL% neq 0 (
 set CFLAGS=/nologo /O1 /MT /W3 /utf-8 /DWIN32_LEAN_AND_MEAN /DCOBJMACROS /D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS /D_WIN32_WINNT=0x0600 /I. /I%OPUS_DIR%\include\ /I%OPUS_DIR%\ /I"%SDK_DIR%\um" /I"%SDK_DIR%\shared"
 set LIBS=opus.lib user32.lib gdi32.lib ole32.lib shell32.lib ws2_32.lib winmm.lib uuid.lib
 
-cl.exe %CFLAGS% /c src\main.c src\audio_capture.c src\audio_playback.c src\codec.c src\jitter_buffer.c src\network.c src\signaling.c src\panel.c src\hotkey.c src\config.c src\dialog.c src\notify.c src\crypto.c src\tiny_aes.c src\aec.c src\agc.c src\ns.c src\congestion.c src\sfu_client.c
+cl.exe %CFLAGS% /c src\main.c src\audio_capture.c src\audio_playback.c src\codec.c src\jitter_buffer.c src\network.c src\signaling.c src\panel.c src\hotkey.c src\config.c src\dialog.c src\notify.c src\crypto.c src\tiny_aes.c src\aec.c src\agc.c src\ns.c src\congestion.c src\sfu_client.c src\logger.c
 if %ERRORLEVEL% neq 0 (
     echo Qmini compilation failed
     exit /b 1

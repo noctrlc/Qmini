@@ -3,15 +3,15 @@
 
 #include <stdint.h>
 
-#define JB_CAPACITY 120
+#define JB_CAPACITY      128   /* power of 2 for fast & mask */
+#define JB_MAX_PACKET    400   /* max Opus encoded frame size */
 
 typedef struct {
-    uint8_t  *packets[JB_CAPACITY];
+    uint8_t  data[JB_CAPACITY][JB_MAX_PACKET]; /* inline packet storage */
     int       sizes[JB_CAPACITY];
     uint16_t  seq_numbers[JB_CAPACITY];
     int       count;
     int       read_cursor;
-    int       write_cursor;
     int       target_level;
     uint32_t  last_arrival_time;   /* Last packet arrival time (ms) */
     uint32_t  jitter_avg;          /* Average jitter (ms) */
