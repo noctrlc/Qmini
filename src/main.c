@@ -712,51 +712,60 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
                     char room[32] = "default";
                     char nick[32] = {0};
                     char password[64] = {0};
-                    strncpy(server, g_cfg.server_addr, sizeof(server) - 1);
-                    strncpy(nick, g_cfg.nickname, sizeof(nick) - 1);
 
-                    if (join_dialog_show(g_panel.inst, g_panel.hwnd,
-                                         server, sizeof(server),
-                                         room, sizeof(room),
-                                         nick, sizeof(nick),
-                                         password, sizeof(password))) {
-                        /* Initialize encryption from password */
-                        if (password[0]) {
-                            crypto_init_from_password(&g_crypto, password);
-                            network_set_crypto(&g_net, &g_crypto);
-                        }
+                    /* Read from inline panel EDIT controls */
+                    HWND srv_edit = GetDlgItem(g_panel.hwnd, 3013);
+                    HWND room_edit = GetDlgItem(g_panel.hwnd, 3014);
+                    HWND nick_edit = GetDlgItem(g_panel.hwnd, 3015);
+                    HWND pass_edit = GetDlgItem(g_panel.hwnd, 3016);
+                    if (srv_edit) GetWindowTextA(srv_edit, server, sizeof(server));
+                    if (room_edit) GetWindowTextA(room_edit, room, sizeof(room));
+                    if (nick_edit) GetWindowTextA(nick_edit, nick, sizeof(nick));
+                    if (pass_edit) GetWindowTextA(pass_edit, password, sizeof(password));
 
-                        join_params_t *jp = (join_params_t*)malloc(sizeof(join_params_t));
-                        if (!jp) continue;
-                        memset(jp, 0, sizeof(*jp));
-                        if (sscanf(server, "%63[^:]:%d", jp->host, &jp->port) < 2)
-                            jp->port = 9088;
-                        strncpy(jp->room, room, sizeof(jp->room) - 1);
-                        strncpy(jp->nick, nick, sizeof(jp->nick) - 1);
-                        jp->sig_port = network_get_port(&g_net);
+                    /* Fallback to config defaults if empty */
+                    if (!server[0]) strncpy(server, g_cfg.server_addr, sizeof(server) - 1);
+                    if (!nick[0]) strncpy(nick, g_cfg.nickname, sizeof(nick) - 1);
+                    if (!room[0]) strncpy(room, "default", sizeof(room) - 1);
 
-                        /* Set callbacks before connect: server may send PEER_JOIN immediately */
-                        g_sig.peer_join_cb = on_peer_join;
-                        g_sig.peer_leave_cb = on_peer_leave;
-                        g_sig.ice_cb = on_ice_msg;
-                        g_sig.relay_cb = on_relay_recv;
-                        g_sig.user_data = NULL;
-
-                        /* Save config so UI reflects intent */
-                        strncpy(g_cfg.server_addr, server, sizeof(g_cfg.server_addr) - 1);
-                        strncpy(g_cfg.nickname, nick, sizeof(g_cfg.nickname) - 1);
-                        config_save(&g_cfg);
-
-                        /* Tooltip shows connecting state */
-                        strncpy(g_svr, server, sizeof(g_svr) - 1);
-                        strncpy(g_rm, room, sizeof(g_rm) - 1);
-                        panel_set_connection(&g_panel, g_svr, g_rm);
-
-                        g_cancel_connect = 0;
-                        g_connecting = 1;
-                        HANDLE h = CreateThread(NULL, 0, join_thread, jp, 0, NULL);
-                        CloseHandle(h);
+                    /* Initialize encryption from password */
+                    if (password[0]) {
+                        crypto_init_from_password(&g_crypto, password);
+                        network_set_crypto(&g_net, &g_crypto);
                     }
+
+                    join_params_t *jp = (join_params_t*)malloc(sizeof(join_params_t));
+                    if (!jp) continue;
+                    memset(jp, 0, sizeof(*jp));
+                    if (sscanf(server, "%63[^:]:%d", jp->host, &jp->port) < 2)
+                        jp->port = 9088;
+                    strncpy(jp->room, room, sizeof(jp->room) - 1);
+                    strncpy(jp->nick, nick, sizeof(jp->nick) - 1);
+                    jp->sig_port = network_get_port(&g_net);
+
+                    /* Set callbacks before connect: server may send PEER_JOIN immediately */
+                    g_sig.peer_join_cb = on_peer_join;
+                    g_sig.peer_leave_cb = on_peer_leave;
+                    g_sig.ice_cb = on_ice_msg;
+                    g_sig.relay_cb = on_relay_recv;
+                    g_sig.user_data = NULL;
+
+                    /* Save config */
+                    strncpy(g_cfg.server_addr, server, sizeof(g_cfg.server_addr) - 1);
+                    strncpy(g_cfg.nickname, nick, sizeof(g_cfg.nickname) - 1);
+                    config_save(&g_cfg);
+
+                    strncpy(g_svr, server, sizeof(g_svr) - 1);
+                    strncpy(g_rm, room, sizeof(g_rm) - 1);
+                    panel_set_connection(&g_panel, g_svr, g_rm);
+
+                    g_cancel_connect = 0;
+                    g_connecting = 1;
+                    SetWindowTextW(GetDlgItem(g_panel.hwnd, 3001), L"◌ 连接中...");
+                    ShowWindow(GetDlgItem(g_panel.hwnd, 3008), SW_HIDE);
+                    ShowWindow(GetDlgItem(g_panel.hwnd, 3009), SW_SHOW);
+                    HANDLE h = CreateThread(NULL, 0, join_thread, jp, 0, NULL);
+                    CloseHandle(h);
                 }
             } else if (cmd_id == TRAY_CMD_LEAVE_ROOM) {
                 if (g_connecting) {
