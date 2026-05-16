@@ -3,9 +3,6 @@
 
 #include <windows.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
 
 /* Command IDs */
 typedef enum {
@@ -77,9 +74,5 @@ const char* panel_get_join_nick(void);
 const char* panel_get_join_pass(void);
 
 static void panel_apply_theme(HWND hwnd) { (void)hwnd; }
-
-#ifdef __cplusplus
-}
-#endif
 
 #endif
