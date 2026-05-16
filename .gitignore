@@ -21,3 +21,4 @@ sig_log.txt
 *.swo
 *~
 qmini_log.txt
+tools/
