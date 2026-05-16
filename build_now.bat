@@ -20,7 +20,8 @@ del src\*.obj 2>nul
 rc /nologo /fo dialog.res src\dialog.rc
 if %ERRORLEVEL% neq 0 (echo RES FAIL & exit /b 1)
 
-cl.exe %CFLAGS% /c src\main.c src\audio_capture.c src\audio_playback.c src\codec.c src\jitter_buffer.c src\network.c src\signaling.c src\panel.c src\hotkey.c src\config.c src\dialog.c src\notify.c src\crypto.c src\tiny_aes.c src\aec.c src\agc.c src\ns.c src\congestion.c src\sfu_client.c src\logger.c
+cl.exe %CFLAGS% /c src\main.c src\audio_capture.c src\audio_playback.c src\codec.c src\jitter_buffer.c src\network.c src\signaling.c src\hotkey.c src\config.c src\dialog.c src\notify.c src\crypto.c src\tiny_aes.c src\aec.c src\agc.c src\ns.c src\congestion.c src\sfu_client.c src\logger.c
+cl.exe %CFLAGS% /TP /c src\panel.c
 if %ERRORLEVEL% neq 0 (echo COMPILE FAIL & exit /b 1)
 
 echo == Linking...
