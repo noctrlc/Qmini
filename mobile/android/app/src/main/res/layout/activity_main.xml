@@ -1,0 +1,179 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="#1a1a2e"
+    android:padding="16dp">
+
+    <!-- 状态栏 -->
+    <TextView
+        android:id="@+id/tv_status"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="未连接"
+        android:textColor="#e94560"
+        android:textSize="14sp"
+        android:paddingBottom="12dp"/>
+
+    <!-- 加入面板 -->
+    <LinearLayout
+        android:id="@+id/panel_join"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical">
+
+        <EditText
+            android:id="@+id/et_server"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:hint="服务器地址 (如 192.168.1.100)"
+            android:textColor="#ffffff"
+            android:textColorHint="#666666"
+            android:background="#16213e"
+            android:padding="12dp"
+            android:inputType="text"
+            android:layout_marginBottom="8dp"/>
+
+        <EditText
+            android:id="@+id/et_room"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:hint="房间名"
+            android:textColor="#ffffff"
+            android:textColorHint="#666666"
+            android:background="#16213e"
+            android:padding="12dp"
+            android:inputType="text"
+            android:layout_marginBottom="8dp"/>
+
+        <EditText
+            android:id="@+id/et_nick"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:hint="昵称"
+            android:textColor="#ffffff"
+            android:textColorHint="#666666"
+            android:background="#16213e"
+            android:padding="12dp"
+            android:inputType="text"
+            android:layout_marginBottom="8dp"/>
+
+        <EditText
+            android:id="@+id/et_password"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:hint="密码 (可选)"
+            android:textColor="#ffffff"
+            android:textColorHint="#666666"
+            android:background="#16213e"
+            android:padding="12dp"
+            android:inputType="textPassword"
+            android:layout_marginBottom="16dp"/>
+
+        <Button
+            android:id="@+id/btn_join"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:text="加入房间"
+            android:background="#e94560"
+            android:textColor="#ffffff"
+            android:textSize="16sp"/>
+
+    </LinearLayout>
+
+    <!-- 房间面板 (加入后显示) -->
+    <LinearLayout
+        android:id="@+id/panel_room"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:orientation="vertical"
+        android:visibility="gone">
+
+        <!-- VU 音量条 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:paddingBottom="8dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="音量 "
+                android:textColor="#aaaaaa"
+                android:textSize="12sp"
+                android:paddingRight="8dp"/>
+
+            <ProgressBar
+                android:id="@+id/vu_meter"
+                style="@android:style/Widget.ProgressBar.Horizontal"
+                android:layout_width="0dp"
+                android:layout_height="8dp"
+                android:layout_weight="1"
+                android:max="100"
+                android:progress="0"
+                android:progressTint="#4ade80"
+                android:progressBackgroundTint="#333333"/>
+        </LinearLayout>
+
+        <!-- 音频控制按钮行 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center"
+            android:paddingBottom="12dp">
+
+            <ImageButton
+                android:id="@+id/btn_mute"
+                android:layout_width="56dp"
+                android:layout_height="56dp"
+                android:src="@android:drawable/ic_btn_speak_now"
+                android:background="#333333"
+                android:scaleType="centerInside"
+                android:contentDescription="静音"
+                android:layout_marginEnd="24dp"/>
+
+            <ImageButton
+                android:id="@+id/btn_speaker"
+                android:layout_width="56dp"
+                android:layout_height="56dp"
+                android:src="@android:drawable/ic_lock_silent_mode_off"
+                android:background="#333333"
+                android:scaleType="centerInside"
+                android:alpha="0.5"
+                android:contentDescription="扬声器"/>
+        </LinearLayout>
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="在线成员"
+            android:textColor="#e94560"
+            android:textSize="16sp"
+            android:paddingBottom="8dp"/>
+
+        <ListView
+            android:id="@+id/lv_members"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:background="#16213e"
+            android:padding="8dp"/>
+
+        <Button
+            android:id="@+id/btn_leave"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:text="离开房间"
+            android:background="#533483"
+            android:textColor="#ffffff"
+            android:textSize="16sp"
+            android:layout_marginTop="12dp"/>
+
+    </LinearLayout>
+
+</LinearLayout>

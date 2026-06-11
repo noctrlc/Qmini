@@ -5,6 +5,7 @@
 #include "network.h"
 #include "signaling.h"
 #include "panel.h"
+#include "tray.h"
 #include "hotkey.h"
 #include "config.h"
 #include "dialog.h"
@@ -47,6 +48,7 @@ typedef struct {
 /* --- Global state --- */
 static config_t           g_cfg;
 static panel_t            g_panel;
+static tray_t             g_tray;
 static hotkey_t           g_hk;
 static audio_capture_t    g_capture;
 static audio_playback_t   g_playback;
@@ -202,6 +204,7 @@ static void update_member_list(void) {
     for (int i = 0; i < g_npeers && n <= MAX_PEERS; i++)
         names[n++] = g_peers[i].nick[0] ? g_peers[i].nick : g_peers[i].id;
     panel_set_members(&g_panel, names, n);
+    tray_set_members(&g_tray, names, n);
 }
 
 static void on_peer_join(const char *peer_id, const char *nickname, struct sockaddr_in *addr, void *user) {
@@ -540,9 +543,11 @@ static void CALLBACK process_timer(HWND hwnd, UINT msg, UINT_PTR id, DWORD time)
             signaling_disconnect(&g_sig);
             g_in_room = 0;
             panel_set_members(&g_panel, NULL, 0);
+            tray_set_members(&g_tray, NULL, 0);
         }
     }
     panel_set_volume(&g_panel, g_peak_pct);
+    tray_set_volume(&g_tray, g_peak_pct);
 
     /* Loopback playback: submit captured audio in chunks */
     if (g_test_playing && g_test_buf && g_test_pos > 0) {
@@ -572,12 +577,14 @@ static void CALLBACK process_timer(HWND hwnd, UINT msg, UINT_PTR id, DWORD time)
         audio_capture_start(&g_capture, on_capture_frame, NULL);
         /* Refresh device name in tooltip */
         panel_set_muted(&g_panel, g_input_mode == INPUT_MODE_MUTED);
+        tray_set_muted(&g_tray, g_input_mode == INPUT_MODE_MUTED);
     }
     if (g_restart_playback) {
         g_restart_playback = 0;
         audio_playback_stop(&g_playback);
         audio_playback_start(&g_playback);
         panel_set_muted(&g_panel, g_input_mode == INPUT_MODE_MUTED);
+        tray_set_muted(&g_tray, g_input_mode == INPUT_MODE_MUTED);
     }
 }
 
@@ -597,8 +604,13 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
         /* panel_create failed - continuing is safe as long as we check hwnd before using */
     }
 
+    /* Initialize system tray */
+    tray_create(&g_tray, inst);
+    tray_set_input_mode(&g_tray, g_input_mode);
+
     panel_set_input_mode(&g_panel, g_input_mode);
     panel_set_muted(&g_panel, g_input_mode == INPUT_MODE_MUTED);
+    tray_set_input_mode(&g_tray, g_input_mode);
     hotkey_init(&g_hk, g_panel.hwnd, g_cfg.ptt_key, g_cfg.mute_key);
 
     g_encoder = codec_enc_create(16000, 1);
@@ -631,10 +643,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
                 g_svr[0] = 0;
                 g_rm[0] = 0;
                 panel_set_connection(&g_panel, "", "");
+                tray_set_connection(&g_tray, "", "");
             } else if (msg.wParam == 1) {
                 g_in_room = 1;
                 update_member_list();
                 panel_set_connection(&g_panel, g_svr, g_rm);
+                tray_set_connection(&g_tray, g_svr, g_rm);
             } else if (jp) {
                 const wchar_t *msg;
                 switch (jp->error_code) {
@@ -660,6 +674,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
                 g_svr[0] = 0;
                 g_rm[0] = 0;
                 panel_set_connection(&g_panel, "", "");
+                tray_set_connection(&g_tray, "", "");
             }
             free(jp);
             continue;
@@ -693,26 +708,35 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
                 }
                 panel_set_input_mode(&g_panel, g_input_mode);
                 panel_set_muted(&g_panel, g_input_mode == INPUT_MODE_MUTED);
+                tray_set_input_mode(&g_tray, g_input_mode);
+                tray_set_muted(&g_tray, g_input_mode == INPUT_MODE_MUTED);
             } else if (cmd_id == TRAY_CMD_MODE_MUTED) {
                 if (g_input_mode != INPUT_MODE_MUTED) g_prev_mode = g_input_mode;
                 g_input_mode = INPUT_MODE_MUTED;
                 panel_set_input_mode(&g_panel, g_input_mode);
                 panel_set_muted(&g_panel, 1);
+                tray_set_input_mode(&g_tray, g_input_mode);
+                tray_set_muted(&g_tray, 1);
             } else if (cmd_id == TRAY_CMD_MODE_PTT) {
                 g_input_mode = INPUT_MODE_PTT;
                 panel_set_input_mode(&g_panel, g_input_mode);
                 panel_set_muted(&g_panel, 0);
+                tray_set_input_mode(&g_tray, g_input_mode);
+                tray_set_muted(&g_tray, 0);
             } else if (cmd_id == TRAY_CMD_MODE_OPEN) {
                 g_input_mode = INPUT_MODE_OPEN;
                 panel_set_input_mode(&g_panel, g_input_mode);
                 panel_set_muted(&g_panel, 0);
+                tray_set_input_mode(&g_tray, g_input_mode);
+                tray_set_muted(&g_tray, 0);
             } else if (cmd_id == TRAY_CMD_JOIN_ROOM) {
                 if (!g_in_room && !g_connecting) {
                     char server[64] = {0};
-                    char room[32] = "default";
+                    char room[32] = {0};
                     char nick[32] = {0};
                     char password[64] = {0};
                     strncpy(server, g_cfg.server_addr, sizeof(server) - 1);
+                    strncpy(room, g_cfg.room, sizeof(room) - 1);
                     strncpy(nick, g_cfg.nickname, sizeof(nick) - 1);
 
                     if (join_dialog_show(g_panel.inst, g_panel.hwnd,
@@ -745,12 +769,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
                         /* Save config so UI reflects intent */
                         strncpy(g_cfg.server_addr, server, sizeof(g_cfg.server_addr) - 1);
                         strncpy(g_cfg.nickname, nick, sizeof(g_cfg.nickname) - 1);
+                        strncpy(g_cfg.room, room, sizeof(g_cfg.room) - 1);
                         config_save(&g_cfg);
 
                         /* Tooltip shows connecting state */
                         strncpy(g_svr, server, sizeof(g_svr) - 1);
                         strncpy(g_rm, room, sizeof(g_rm) - 1);
                         panel_set_connection(&g_panel, g_svr, g_rm);
+                        tray_set_connection(&g_tray, g_svr, g_rm);
 
                         g_cancel_connect = 0;
                         g_connecting = 1;
@@ -766,6 +792,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
                     g_svr[0] = 0;
                     g_rm[0] = 0;
                     panel_set_connection(&g_panel, "", "");
+                    tray_set_connection(&g_tray, "", "");
                 } else if (g_in_room) {
                     /* Close SFU client */
                     sfu_close(&g_sfu);
@@ -792,6 +819,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
                     g_rm[0] = 0;
                     panel_set_connection(&g_panel, "", "");
                     panel_set_members(&g_panel, NULL, 0);
+                    tray_set_connection(&g_tray, "", "");
+                    tray_set_members(&g_tray, NULL, 0);
                 }
             } else if (cmd_id == TRAY_CMD_TEST_AUDIO) {
                 /* Step 1: Test tone to verify output */
@@ -859,6 +888,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
     DeleteCriticalSection(&g_sig.send_lock);
 
     hotkey_destroy(&g_hk);
+    tray_destroy(&g_tray);
     panel_destroy(&g_panel);
     notify_shutdown(NULL, NULL);
     LOG_INFO("Qmini shutdown");

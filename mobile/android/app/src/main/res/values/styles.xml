@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.QminiVoice" parent="Theme.AppCompat.NoActionBar">
+        <item name="colorPrimary">#e94560</item>
+        <item name="colorPrimaryDark">#1a1a2e</item>
+        <item name="colorAccent">#533483</item>
+        <item name="android:windowBackground">@color/bg_dark</item>
+        <item name="android:statusBarColor">#1a1a2e</item>
+        <item name="android:navigationBarColor">#1a1a2e</item>
+    </style>
+    <color name="bg_dark">#1a1a2e</color>
+</resources>

@@ -7,6 +7,7 @@
 typedef struct {
     char  server_addr[64];
     char  nickname[32];
+    char  room[32];
     int   ptt_key;
     int   mute_key;
     int   enable_fec;

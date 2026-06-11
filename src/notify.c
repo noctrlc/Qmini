@@ -94,12 +94,17 @@ int notify_init(void *unused, int *restart_capture, int *restart_playback) {
 
 void notify_shutdown(void *unused, void *unused2) {
     (void)unused; (void)unused2;
-    if (g_notify_client && g_notify_client->enumerator) {
-        IMMDeviceEnumerator *e = (IMMDeviceEnumerator*)g_notify_client->enumerator;
-        IMMDeviceEnumerator_UnregisterEndpointNotificationCallback(e, (IMMNotificationClient*)g_notify_client);
-        IMMDeviceEnumerator_Release(e);
+    if (g_notify_client) {
+        if (g_notify_client->enumerator) {
+            IMMDeviceEnumerator *e = (IMMDeviceEnumerator*)g_notify_client->enumerator;
+            IMMDeviceEnumerator_UnregisterEndpointNotificationCallback(e, (IMMNotificationClient*)g_notify_client);
+            IMMDeviceEnumerator_Release(e);
+            g_notify_client->enumerator = NULL;
+        }
+        /* BUG FIX: release the client struct (ref was 1 from calloc) */
+        nc_release((IMMNotificationClient*)g_notify_client);
+        g_notify_client = NULL;
     }
-    g_notify_client = NULL;
 }
 
 void* notify_get_client(void) {

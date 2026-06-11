@@ -135,7 +135,10 @@ void tray_destroy(tray_t *t) {
     Shell_NotifyIconW(NIM_DELETE, &nid);
     if (t->icon) DestroyIcon(t->icon);
     if (t->icon_active) DestroyIcon(t->icon_active);
-    if (t->menu) DestroyMenu(t->menu);
+    /* BUG FIX: destroy submenus explicitly before parent menu */
+    if (t->mode_menu) { DestroyMenu(t->mode_menu); t->mode_menu = NULL; }
+    if (t->member_menu) { DestroyMenu(t->member_menu); t->member_menu = NULL; }
+    if (t->menu) { DestroyMenu(t->menu); t->menu = NULL; }
     if (t->hwnd) DestroyWindow(t->hwnd);
 }
 
@@ -168,9 +171,9 @@ void tray_set_volume(tray_t *t, int peak_pct) {
         nid.uFlags = NIF_TIP;
         if (t->room[0]) {
             _snwprintf(nid.szTip, 128,
-                L"Qmini [%hs] @ %hs\n音量: %d%% | 在线: %d 人%s\n%hs\n%hs",
+                L"Qmini [%hs] @ %hs\n音量: %d%% | 在线: %d 人%hs\n%hs\n%hs",
                 t->room, t->server, peak_pct, t->member_count,
-                t->muted ? L" [已静音]" : L"",
+                t->muted ? " [已静音]" : "",
                 audio_capture_get_device_name(),
                 audio_playback_get_device_name());
         } else {
@@ -180,6 +183,8 @@ void tray_set_volume(tray_t *t, int peak_pct) {
                 audio_capture_get_device_name(),
                 audio_playback_get_device_name());
         }
+        /* BUG FIX: ensure null-termination after _snwprintf */
+        nid.szTip[127] = L'\0';
         Shell_NotifyIconW(NIM_MODIFY, &nid);
     }
 }
@@ -206,9 +211,9 @@ void tray_set_muted(tray_t *t, int muted) {
 
     if (t->room[0]) {
         _snwprintf(nid.szTip, 128,
-            L"Qmini [%hs] @ %hs\n在线: %d 人%s\n%hs\n%hs",
+            L"Qmini [%hs] @ %hs\n在线: %d 人%hs\n%hs\n%hs",
             t->room, t->server, t->member_count,
-            muted ? L" [已静音]" : L"",
+            muted ? " [已静音]" : "",
             audio_capture_get_device_name(),
             audio_playback_get_device_name());
     } else {
@@ -217,6 +222,8 @@ void tray_set_muted(tray_t *t, int muted) {
             audio_capture_get_device_name(),
             audio_playback_get_device_name());
     }
+    /* BUG FIX: ensure null-termination after _snwprintf */
+    nid.szTip[127] = L'\0';
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
@@ -232,7 +239,9 @@ void tray_set_members(tray_t *t, const char *names[], int count) {
     } else {
         for (int i = 0; i < count; i++) {
             wchar_t wbuf[64];
-            mbstowcs(wbuf, names[i], 64);
+            /* BUG FIX: use MultiByteToWideChar for proper UTF-8 support */
+            MultiByteToWideChar(CP_UTF8, 0, names[i], -1, wbuf, 64);
+            wbuf[63] = L'\0';
             AppendMenuW(t->member_menu, MF_STRING, 0, wbuf);
         }
         EnableMenuItem(t->menu, (UINT)(UINT_PTR)t->member_menu, MF_BYCOMMAND | MF_ENABLED);

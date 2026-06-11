@@ -3,21 +3,41 @@
 
 #include <windows.h>
 
+/* Command IDs are defined in panel.h; tray.h reuses them.
+   When panel.h is not included, define fallbacks here. */
+#ifndef _PANEL_CMD_DEFINED
+#define _PANEL_CMD_DEFINED
 typedef enum {
-    TRAY_CMD_JOIN_ROOM = 1,
-    TRAY_CMD_LEAVE_ROOM,
-    TRAY_CMD_TOGGLE_MUTE,
-    TRAY_CMD_MODE_MUTED,
-    TRAY_CMD_MODE_PTT,
-    TRAY_CMD_MODE_OPEN,
-    TRAY_CMD_TEST_AUDIO,
-    TRAY_CMD_AUDIO_DEVICES,
-    TRAY_CMD_EXIT,
-} tray_cmd_t;
+    PANEL_CMD_JOIN_ROOM = 1,
+    PANEL_CMD_LEAVE_ROOM,
+    PANEL_CMD_TOGGLE_MUTE,
+    PANEL_CMD_MODE_MUTED,
+    PANEL_CMD_MODE_PTT,
+    PANEL_CMD_MODE_OPEN,
+    PANEL_CMD_TEST_AUDIO,
+    PANEL_CMD_AUDIO_DEVICES,
+    PANEL_CMD_EXIT,
+} panel_cmd_t;
+#endif
 
+/* TRAY_CMD_* aliases (use PANEL_CMD_* if panel.h already defined them) */
+#ifndef TRAY_CMD_JOIN_ROOM
+#define TRAY_CMD_JOIN_ROOM     PANEL_CMD_JOIN_ROOM
+#define TRAY_CMD_LEAVE_ROOM    PANEL_CMD_LEAVE_ROOM
+#define TRAY_CMD_TOGGLE_MUTE   PANEL_CMD_TOGGLE_MUTE
+#define TRAY_CMD_MODE_MUTED    PANEL_CMD_MODE_MUTED
+#define TRAY_CMD_MODE_PTT      PANEL_CMD_MODE_PTT
+#define TRAY_CMD_MODE_OPEN     PANEL_CMD_MODE_OPEN
+#define TRAY_CMD_TEST_AUDIO    PANEL_CMD_TEST_AUDIO
+#define TRAY_CMD_AUDIO_DEVICES PANEL_CMD_AUDIO_DEVICES
+#define TRAY_CMD_EXIT          PANEL_CMD_EXIT
+#endif
+
+#ifndef INPUT_MODE_MUTED
 #define INPUT_MODE_MUTED 0
 #define INPUT_MODE_PTT   1
 #define INPUT_MODE_OPEN  2
+#endif
 
 typedef struct {
     HWND     hwnd;

@@ -11,6 +11,11 @@ opus.lib
 # Logs
 *.log
 sig_log.txt
+qmini_log.txt
+
+# Build artifacts
+release/
+*.apk
 
 # IDE / temp
 .vscode/
@@ -20,6 +25,17 @@ sig_log.txt
 *.swp
 *.swo
 *~
-qmini_log.txt
 tools/
 .superpowers/
+
+# Android build
+mobile/android/.gradle/
+mobile/android/.cxx/
+mobile/android/build/
+mobile/android/app/build/
+mobile/android/local.properties
+mobile/android/gradle/wrapper/gradle-wrapper.jar
+
+# Deploy scripts (keep local)
+deploy.py
+deploy_server.sh

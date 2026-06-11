@@ -4,6 +4,8 @@
 #include <windows.h>
 
 /* Command IDs (same values as old TRAY_CMD_*) */
+#ifndef _PANEL_CMD_DEFINED
+#define _PANEL_CMD_DEFINED
 typedef enum {
     PANEL_CMD_JOIN_ROOM = 1,
     PANEL_CMD_LEAVE_ROOM,
@@ -15,8 +17,10 @@ typedef enum {
     PANEL_CMD_AUDIO_DEVICES,
     PANEL_CMD_EXIT,
 } panel_cmd_t;
+#endif
 
-/* Backward-compatible aliases for main.c */
+/* Backward-compatible aliases for main.c (only if tray.h not included) */
+#ifndef TRAY_H
 #define TRAY_CMD_JOIN_ROOM     PANEL_CMD_JOIN_ROOM
 #define TRAY_CMD_LEAVE_ROOM    PANEL_CMD_LEAVE_ROOM
 #define TRAY_CMD_TOGGLE_MUTE   PANEL_CMD_TOGGLE_MUTE
@@ -26,6 +30,7 @@ typedef enum {
 #define TRAY_CMD_TEST_AUDIO    PANEL_CMD_TEST_AUDIO
 #define TRAY_CMD_AUDIO_DEVICES PANEL_CMD_AUDIO_DEVICES
 #define TRAY_CMD_EXIT          PANEL_CMD_EXIT
+#endif
 
 #define INPUT_MODE_MUTED 0
 #define INPUT_MODE_PTT   1
@@ -48,13 +53,19 @@ typedef enum {
 typedef struct {
     HWND     hwnd;
     HINSTANCE inst;
-    HFONT    hfont;
-    HFONT    hfont_brand;
-    HBRUSH   hbrush_mic_bg;
-    HBRUSH   hbrush_mic_on;
+    HFONT    hfont;          /* Segoe UI 9pt */
+    HFONT    hfont_brand;    /* Segoe UI 10pt bold */
+    HBRUSH   hbrush_bg;      /* main background */
+    HBRUSH   hbrush_panel;   /* input/list background */
+    HBRUSH   hbrush_mic_bg;  /* volume bar background */
+    HBRUSH   hbrush_mic_on;  /* volume bar fill */
+    HPEN     hpen_border;    /* border line */
+    HBRUSH   hbrush_btn;     /* button face */
+    HBRUSH   hbrush_btn_hot; /* button hover */
     int      muted;
     int      peak_pct;
     int      member_count;
+    int      btn_hover;      /* hovered button ID, 0 = none */
     char     server[64];
     char     room[32];
 } panel_t;
